@@ -225,8 +225,13 @@ class Trainer():
                         
                         # ==== 对每个view 的子集计算loss =====
                     for k in subset_views_list:
-                        subset_ids, (corrs_k, vis_k) = batch_points_dict[k]
+                        view_ids, (corrs_k, vis_k) = batch_points_dict[k]
                         N_points = corrs_k.shape[0]
+                        
+                        corrs_k = corrs_k.to(self.dev)
+                        vis_k = vis_k.to(self.dev) if vis_k is not None else None
+                        
+                        local_to_global = [id_to_idx[v] for v in view_ids]
 
                         # ==== 限制最小点数 =====
                         if N_points < 10:
@@ -241,13 +246,13 @@ class Trainer():
                                 
                         # ===== 采样 multi-view 特征 =====
                         feat_per_point, hmap_per_point, kpts_per_point = [], [], []
-                        for local_v, global_v in enumerate(subset_ids):
+                        for local_v, global_v in enumerate(local_to_global):
                             coords = corrs_k[:, local_v, :].to(self.dev)
                             # 采样描述子
 
-                            feat_sample = sample_map_at_coords(feats[local_v], coords, H_orig, W_orig)
-                            hmap_sample = sample_map_at_coords(hmap[local_v], coords, H_orig, W_orig)
-                            kpts_sample = sample_map_at_coords(kpts[local_v], coords, H_orig, W_orig) 
+                            feat_sample = sample_map_at_coords(feats[global_v], coords, H_orig, W_orig)
+                            hmap_sample = sample_map_at_coords(hmap[global_v], coords, H_orig, W_orig)
+                            kpts_sample = sample_map_at_coords(kpts[global_v], coords, H_orig, W_orig) 
                                 
                             feat_per_point.append(feat_sample)
                             hmap_per_point.append(hmap_sample)
@@ -276,13 +281,15 @@ class Trainer():
                             
                         # ===== kpts loss =====
                         loss_kpts_b = 0.0
-                        for v in range(k):
-                            pred_hm = kpts[v]  # [1, 65, H/8, W/8]
-                            img_v = d['images'][v]  # [3, H_orig, W_orig] or [1,...]
+                        cnt = 0.0
+                        for local_v, global_v in enumerate(local_to_global):
+                            pred_hm = kpts[global_v]  # [1, 65, H/8, W/8]
+                            img_v = d['images'][global_v]  # [3, H_orig, W_orig] or [1,...]
                             loss_hm_v, acc_hm_v = alike_distill_loss(pred_hm[0], img_v[0])
                             loss_kpts_b += loss_hm_v
+                            cnt+=1
 
-                        loss_kpts_total += loss_kpts_b / k
+                        loss_kpts_total += loss_kpts_b / max(cnt, 1)
                         valid_batch += 1
 
                 loss_desc = loss_desc_total / valid_batch if valid_batch > 0 else torch.tensor(0.0, device=self.dev, requires_grad=True)
