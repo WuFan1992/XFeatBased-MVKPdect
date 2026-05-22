@@ -241,13 +241,13 @@ class Trainer():
                                 
                         # ===== 采样 multi-view 特征 =====
                         feat_per_point, hmap_per_point, kpts_per_point = [], [], []
-                        for v in range(k):
-                            coords = corrs_k[:, v, :].to(self.dev)
+                        for local_v, global_v in enumerate(subset_ids):
+                            coords = corrs_k[:, local_v, :].to(self.dev)
                             # 采样描述子
 
-                            feat_sample = sample_map_at_coords(feats[v], coords, H_orig, W_orig)
-                            hmap_sample = sample_map_at_coords(hmap[v], coords, H_orig, W_orig)
-                            kpts_sample = sample_map_at_coords(kpts[v], coords, H_orig, W_orig) 
+                            feat_sample = sample_map_at_coords(feats[local_v], coords, H_orig, W_orig)
+                            hmap_sample = sample_map_at_coords(hmap[local_v], coords, H_orig, W_orig)
+                            kpts_sample = sample_map_at_coords(kpts[local_v], coords, H_orig, W_orig) 
                                 
                             feat_per_point.append(feat_sample)
                             hmap_per_point.append(hmap_sample)
