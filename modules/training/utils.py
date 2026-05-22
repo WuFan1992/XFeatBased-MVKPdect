@@ -198,3 +198,4 @@ def get_nb_trainable_params(model):
 	nb_params = sum([np.prod(p.size()) for p in model_parameters])
  
 	print('Number of trainable parameters: {:d}'.format(nb_params))
+ 

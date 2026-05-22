@@ -1,18 +1,7 @@
-"""
-	"XFeat: Accelerated Features for Lightweight Image Matching, CVPR 2024."
-	https://www.verlab.dcc.ufmg.br/descriptors/xfeat_cvpr24/
-
-    MegaDepth data handling was adapted from 
-    LoFTR official code: https://github.com/zju3dv/LoFTR/blob/master/src/datasets/megadepth.py
-"""
-
 import torch
 from kornia.utils import create_meshgrid
-import matplotlib.pyplot as plt
-import pdb
-import cv2
+import numpy as np
 
-from modules.training.utils import plot_corrs
 
 @torch.no_grad()
 def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1):
@@ -66,8 +55,8 @@ def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1):
     w_kpts0 = w_kpts0_h[:, :, :2] / (w_kpts0_h[:, :, [2]] + 1e-5)  # (N, L, 2), +1e-4 to avoid zero depth
 
     # Covisible Check
-    # h, w = depth1.shape[1:3]
-    # covisible_mask = (w_kpts0[:, :, 0] > 0) * (w_kpts0[:, :, 0] < w-1) * \
+    #h, w = depth1.shape[1:3]
+    #covisible_mask = (w_kpts0[:, :, 0] > 0) * (w_kpts0[:, :, 0] < w-1) * \
     #     (w_kpts0[:, :, 1] > 0) * (w_kpts0[:, :, 1] < h-1)
     # w_kpts0_long = w_kpts0.long()
     # w_kpts0_long[~covisible_mask, :] = 0
@@ -81,130 +70,235 @@ def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1):
     valid_mask = nonzero_mask #* consistent_mask* covisible_mask 
 
     return valid_mask, w_kpts0
+def generate_exclusive_subsets(batch_data, subset_views_list=[5,4,3,2], scale=4):
+    """
+    生成递减互斥的多视图匹配子集。
+    
+    Args:
+        batch_data: dict, 包含 'images', 'depths', 'Ks', 'T_0to', 'T', 'scales', 'all_5view_ids'
+        subset_views_list: list[int], e.g., [5,4,3,2]
+        scale: int, 下采样比例
+    
+    Returns:
+        batch_points_dict: dict, k -> (subset_ids, (multi_corrs, vis))
+    """
+    multi_corrs_5view, vis_5view = generate_multi_corrs_from_data(batch_data, scale=scale)
 
+    # ===== 处理 all_ids =====
+    all_ids = batch_data['all_5view_ids']
+    if isinstance(all_ids, torch.Tensor):
+        all_ids = all_ids.cpu().numpy().flatten().tolist()
+    all_ids = [int(x) if not isinstance(x, int) else x for x in all_ids]
+    id_to_idx = {vid: i for i, vid in enumerate(all_ids)}
+
+    batch_points_dict = {}
+    used_points = set()  # 用于记录已经被使用的匹配点坐标 (anchor view)
+
+    for k in subset_views_list:
+        if k == 5:
+            # 保留全部 5-view 点
+            batch_points_dict[5] = (all_ids, (multi_corrs_5view, vis_5view))
+            # 添加 anchor 坐标到 used_points，舍入到1位小数避免精度问题
+            anchor_coords = multi_corrs_5view[:, 0].cpu().numpy()  # [N, 2]
+            used_points.update(tuple(np.round(coord, 1)) for coord in anchor_coords)
+        else:
+            # 生成互斥子集
+            subset_ids, (multi_corrs_k, vis_k) = select_subset_and_recompute_multi_corrs(
+                batch_data,
+                subset_views=k,
+                scale=scale,
+                used_points=used_points
+            )
+           # 如果返回为空，则给空数组
+            if multi_corrs_k is None or multi_corrs_k.shape[0] == 0:
+                subset_ids, multi_corrs_k, vis_k = [], np.zeros((0, k, 2)), None
+            else:
+                # 强制 subset_ids 全部为 Python int
+                subset_ids = [int(x) if not isinstance(x, int) else x for x in subset_ids]
+
+            batch_points_dict[k] = (subset_ids, (multi_corrs_k, vis_k))
+
+    return batch_points_dict, id_to_idx
+
+# ================================
+# 1️⃣ 生成完整 5-view 对应点
+# ================================
+@torch.no_grad()
+def generate_multi_corrs_from_data(data, scale=8, cycle_thresh=1.5):
+    """
+    从 data (5-view) 中生成 multi-view 对应点坐标。
+
+    Args:
+        data: dict, 包含 keys 'images', 'depths', 'Ks', 'T_0to', 'scales', 'image_masks'
+              每个 key 是 list of length V (view 数量)
+        scale: 下采样比例
+        cycle_thresh: cycle consistency 阈值
+
+    Returns:
+        multi_corrs: torch.Tensor, [num_points, V, 2] 对应原图坐标
+        vis: torch.Tensor, [num_points, V] bool 掩码，表示每个点在每个view中的有效性
+    """
+    device = data['images'][0].device
+    B = 1  # 单个 scene
+
+    images = [img.unsqueeze(0) if img.dim()==3 else img for img in data['images']]
+    depths = [d.unsqueeze(0) if d.dim()==2 else d for d in data['depths']]
+    Ks = [K.unsqueeze(0) if K.dim()==2 else K for K in data['Ks']]
+    T_0to = [T.unsqueeze(0) if T.dim()==2 else T for T in data['T_0to']]
+    scales = [torch.tensor([s], device=device) if not isinstance(s, torch.Tensor) else s for s in data['scales']]
+    
+    # 获取masks，用于检查有效区域
+    masks = data.get('image_masks', None)
+    if masks is not None:
+        masks = [m.to(device) if isinstance(m, torch.Tensor) else torch.from_numpy(m).to(device) for m in masks]
+
+    # ===== 1. reference grid =====
+    _, _, H, W = images[0].shape
+    h, w = H // scale, W // scale
+    grid = create_meshgrid(h, w, False, device).reshape(1, h*w, 2)
+    grid_i = grid * scale  # 原图坐标
+
+    valid_all = torch.ones((1, h*w), dtype=torch.bool, device=device)
+    all_points = [grid_i]
+
+    # ===== 2. cycle consistency =====
+    V = len(images)
+    for i in range(1, V):
+        valid_fw, warped_fw = warp_kpts(grid_i, depths[0], depths[i], T_0to[i], Ks[0], Ks[i])
+        T_i_to_0 = torch.inverse(T_0to[i])
+        valid_bw, warped_bw = warp_kpts(warped_fw, depths[i], depths[0], T_i_to_0, Ks[i], Ks[0])
+        dist = torch.norm(grid_i - warped_bw, dim=-1)
+        mask_cycle = dist < cycle_thresh
+        valid = valid_fw & valid_bw & mask_cycle
+        valid_all &= valid
+        all_points.append(warped_fw)
+
+    # ===== 3. final filtering =====
+    final_mask = valid_all[0]
+    if final_mask.sum() == 0:
+        empty_corrs = torch.empty((0, V, 2), device=device)
+        empty_vis = torch.empty((0, V), dtype=torch.bool, device=device)
+        return empty_corrs, empty_vis
+
+    pts = [p[0, final_mask] for p in all_points]
+    multi_corrs_5view = torch.stack(pts, dim=1)  # [num_points, V, 2]
+
+    # ===== 4. scale 回原图 =====
+    for i in range(V):
+        multi_corrs_5view[:, i, 0] /= scales[i][0]  # x scale
+        multi_corrs_5view[:, i, 1] /= scales[i][1]  # y scale
+    
+    # ===== 5. vis mask：检查每个点在每个view中的有效性 =====
+    N_points = multi_corrs_5view.shape[0]
+    vis = torch.ones((N_points, V), dtype=torch.bool, device=device)
+    
+    # 如果有masks，检查坐标是否在有效区域内
+    if masks is not None:
+        for v in range(V):
+            mask_v = masks[v]  # [H, W]
+            H_mask, W_mask = mask_v.shape
+            
+            # 获取该view的所有坐标
+            coords_v = multi_corrs_5view[:, v, :].long()  # [N_points, 2]
+            
+            # 检查坐标边界
+            in_bounds = (coords_v[:, 0] >= 0) & (coords_v[:, 0] < W_mask) & \
+                       (coords_v[:, 1] >= 0) & (coords_v[:, 1] < H_mask)
+            
+            # 检查mask值
+            valid_coords = in_bounds.clone()
+            for j in range(N_points):
+                if in_bounds[j]:
+                    x, y = coords_v[j, 0].item(), coords_v[j, 1].item()
+                    # mask值为1表示有效，0表示无效（padding或遮挡）
+                    valid_coords[j] = mask_v[y, x] > 0.5
+            
+            vis[:, v] = valid_coords
+
+    return multi_corrs_5view, vis
 
 @torch.no_grad()
-def spvs_coarse(data, scale = 8):
+def select_subset_and_recompute_multi_corrs(data_5view, subset_views=3, scale=4, used_points=None):
     """
-        Supervise corresp with dense depth & camera poses
+    生成 k-view 对应点，保证与 used_points 互斥。
     """
+    import numpy as np
+    import torch
+    from copy import deepcopy
 
-    # 1. misc
-    device = data['image0'].device
-    N, _, H0, W0 = data['image0'].shape
-    _, _, H1, W1 = data['image1'].shape
-    #scale = 8
-    scale0 = scale * data['scale0'][:, None] if 'scale0' in data else scale
-    scale1 = scale * data['scale1'][:, None] if 'scale1' in data else scale
-    h0, w0, h1, w1 = map(lambda x: x // scale, [H0, W0, H1, W1])
+    if used_points is None:
+        used_points = set()
 
-    # 2. warp grids
-    # create kpts in meshgrid and resize them to image resolution
-    grid_pt1_c = create_meshgrid(h1, w1, False, device).reshape(1, h1*w1, 2).repeat(N, 1, 1)    # [N, hw, 2]
-    grid_pt1_i = scale1 * grid_pt1_c
+    # 统一 all_ids 类型
+    all_ids = data_5view['all_5view_ids']
+    if isinstance(all_ids, torch.Tensor):
+        all_ids = all_ids.cpu().numpy().flatten().tolist()
+    all_ids = [int(x.item()) if isinstance(x, torch.Tensor) else int(x) for x in all_ids]
 
-    # warp kpts bi-directionally and check reproj error
-    nonzero_m1, w_pt1_i  =  warp_kpts(grid_pt1_i, data['depth1'], data['depth0'], data['T_1to0'], data['K1'], data['K0']) 
-    nonzero_m2, w_pt1_og =  warp_kpts(   w_pt1_i, data['depth0'], data['depth1'], data['T_0to1'], data['K0'], data['K1']) 
+    # 随机选择 subset_views 个 view（保证 anchor 在内）
+    anchor_id = all_ids[0]
+    remaining_ids = [v for v in all_ids if v != anchor_id]
+    if subset_views == 1:
+        subset_ids = [anchor_id]
+    elif subset_views == 2:
+        # 对于2-view，使用前两个（假设是原始pair）
+        subset_ids = all_ids[:2]
+    else:
+        subset_ids = [anchor_id] + list(np.random.choice(remaining_ids, subset_views-1, replace=False))
 
-    # 先将图像1投影到图像2，然后投影点再从图像2投影回图像1，用于双向一致性校验
-    dist = torch.linalg.norm( grid_pt1_i - w_pt1_og, dim=-1)
-    mask_mutual = (dist < 1.5) & nonzero_m1 & nonzero_m2
+    # 构造子集 data
+    subset_indices = [all_ids.index(v) for v in subset_ids]
+    data_subset = deepcopy(data_5view)
+    # 复制所有list类型的key
+    for key in ['images', 'depths', 'Ks', 'T_0to', 'T', 'scales', 'image_masks']:
+        if key in data_subset:
+            data_subset[key] = [data_subset[key][i] for i in subset_indices]
+    data_subset['all_5view_ids'] = subset_ids
 
-    #_, w_pt1_i = warp_kpts(grid_pt1_i, data['depth1'], data['depth0'], data['T_1to0'], data['K1'], data['K0'])
-    # 构建GT 对应点 
-    """
-    batched_corrs = [
-       [x0,y0,x1,y1], ...
-       ]
-    """
-    batched_corrs = [ torch.cat([w_pt1_i[i, mask_mutual[i]] / data['scale0'][i],
-                       grid_pt1_i[i, mask_mutual[i]] / data['scale1'][i]],dim=-1) for i in range(len(mask_mutual))]
+    # 生成 multi_corrs
+    multi_corrs_subset, vis_tensor = generate_multi_corrs_from_data(data_subset, scale=scale)
+
+    # ===== 安全互斥处理 =====
+    if len(used_points) > 0 and multi_corrs_subset.shape[0] > 0:
+        keep_indices = []
+        for i in range(multi_corrs_subset.shape[0]):
+            anchor_coord = tuple(np.round(multi_corrs_subset[i, 0].cpu().numpy(), 1))
+            if anchor_coord not in used_points:
+                keep_indices.append(i)
+                used_points.add(anchor_coord)  # 添加到 used_points 以防后续子集使用
+        
+        if keep_indices:
+            multi_corrs_subset = multi_corrs_subset[keep_indices]
+            vis_tensor = vis_tensor[keep_indices]
+        else:
+            multi_corrs_subset = torch.empty((0, subset_views, 2), device=multi_corrs_subset.device)
+            vis_tensor = torch.empty((0, subset_views), dtype=torch.bool, device=vis_tensor.device)
+
+    return subset_ids, (multi_corrs_subset, vis_tensor)
+"""
+    multi_coors: [N, 5, 2]
+    N 是匹配点的数量
     
-    # batched_corrs[i] 形状 = (Ni, 4) 每一行: [x0, y0, x1, y1] 图0上的点 (x0,y0) 对应 图1上的点 (x1,y1)
+    multi_corrs[i] = [
+    [x0, y0],   # image0 (anchor)
+    [x1, y1],   # image1
+    [x2, y2],   # image2
+    [x3, y3],   # image3
+    [x4, y4],   # image4
+]
 
+"""
+"""
+batch_5 = dataset[idx]  # 5-view 原始数据
 
-    #Remove repeated correspondences - this is important for network convergence
-    # 去重的原因是，很多在相机空间的3D 点，投影到图像平面后，投影点的位置很近，再进行离散的网格处理后，可能会出现不同的3D点投影到
-    # 同一位置
-    corrs = []
-    for pts in batched_corrs:
-        lut_mat12 = torch.ones((h1, w1, 4), device = device, dtype = torch.float32) * -1  # 每个 coarse 像素位置存一个 [x0,y0,x1,y1] 初始化存-1 表示空
-        lut_mat21 = torch.clone(lut_mat12)
-        src_pts = pts[:, :2] / scale
-        tgt_pts = pts[:, 2:] / scale
-        try:
-            # 如果有多个3D 点同时映射到同一个像素位置，自动覆盖从而实现去重的目的
-            # 这里进行了两次去重，一次是src to tgt ，避免one to many 
-            # 第二次是去重是tgt to src 避免many to one
-            lut_mat12[src_pts[:,1].long(), src_pts[:,0].long()] = torch.cat([src_pts, tgt_pts], dim=1)  
-            # 例如有A: (10,20) → (30,40) B: (10,20) → (35,45) 第二次赋值会：覆盖第一次 最终的结果是，一个source 像素只会保留一个匹配
-            mask_valid12 = torch.all(lut_mat12 >= 0, dim=-1)
-            points = lut_mat12[mask_valid12]
+# 从5-view里随机选4-view，并重新计算对应点
+batch_4, multi_corrs_4 = select_subset_and_recompute_multi_corrs(batch_5, subset_views=4)
 
-            #Target-src check 
-            src_pts, tgt_pts = points[:, :2], points[:, 2:]
-            lut_mat21[tgt_pts[:,1].long(), tgt_pts[:,0].long()] = torch.cat([src_pts, tgt_pts], dim=1)
-            # 例如有A: (10,20) → (30,40) B: (11,20) → (30,40) 第二次赋值会：覆盖第一次 最终的结果是，一个source 像素只会保留一个匹配
-            mask_valid21 = torch.all(lut_mat21 >= 0, dim=-1)
-            points = lut_mat21[mask_valid21]
+# 从5-view里随机选3-view，并重新计算对应点
+batch_3, multi_corrs_3 = select_subset_and_recompute_multi_corrs(batch_5, subset_views=3)
 
-            corrs.append(points)
-        except:
-            pdb.set_trace()
-            print('..')
+# 从5-view里随机选2-view，并重新计算对应点
+batch_2, multi_corrs_2 = select_subset_and_recompute_multi_corrs(batch_5, subset_views=2)
 
-    #Plot for debug purposes    
-    # for i in range(len(corrs)):
-    #     plot_corrs(data['image0'][i], data['image1'][i], corrs[i][:, :2]*8, corrs[i][:, 2:]*8)
-
-    return corrs
-
-    """
-    corrs = [
-   Tensor(M1, 4),   # batch 0
-   Tensor(M2, 4),   # batch 1
-   ...
-    ]
-    
-    例如
-    当batch = 2 时
-    corrs = [
-    tensor([
-        [12., 18., 30., 25.],  这里 第一张图的(12, 18) 对应 第二张图的(30, 25)
-        [13., 18., 31., 25.],
-        [14., 19., 32., 26.]
-    ]),  # 第1对图像的GT匹配
-
-    tensor([
-        [5., 10., 40., 20.],
-        [6., 11., 41., 21.]
-    ])   # 第2对图像的GT匹配
-]   
-    """
-    
-
-@torch.no_grad()
-def get_correspondences(pts2, data, idx):
-    device = data['image0'].device
-    N, _, H0, W0 = data['image0'].shape
-    _, _, H1, W1 = data['image1'].shape
-
-    pts2 = pts2[None, ...]
-
-    scale0 = data['scale0'][idx, None][None, ...] if 'scale0' in data else 1
-    scale1 = data['scale1'][idx, None][None, ...] if 'scale1' in data else 1
-
-    pts2 = scale1 * pts2 * 8
-
-    # warp kpts bi-directionally and check reproj error
-    nonzero_m1, pts1  = warp_kpts(pts2, data['depth1'][idx][None, ...], data['depth0'][idx][None, ...], data['T_1to0'][idx][None, ...], 
-                                                                        data['K1'][idx][None, ...], data['K0'][idx][None, ...]) 
-
-    corrs = torch.cat([pts1[0, :] / data['scale0'][idx],
-                       pts2[0, :] / data['scale1'][idx]],dim=-1)
-
-    #plot_corrs(data['image0'][idx], data['image1'][idx], corrs[:, :2], corrs[:, 2:])
-
-    return corrs
+"""
 

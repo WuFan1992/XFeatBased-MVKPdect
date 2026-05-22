@@ -1,54 +1,14 @@
-"""
-	"XFeat: Accelerated Features for Lightweight Image Matching, CVPR 2024."
-	https://www.verlab.dcc.ufmg.br/descriptors/xfeat_cvpr24/
-
-    MegaDepth data handling was adapted from 
-    LoFTR official code: https://github.com/zju3dv/LoFTR/blob/master/src/datasets/megadepth.py
-"""
-
-import io
 import cv2
 import numpy as np
 import h5py
 import torch
-from numpy.linalg import inv
+import torch.nn.functional as F
 
 
-try:
-    # for internel use only
-    from .client import MEGADEPTH_CLIENT, SCANNET_CLIENT
-except Exception:
-    MEGADEPTH_CLIENT = SCANNET_CLIENT = None
 
-# --- DATA IO ---
-
-def load_array_from_s3(
-    path, client, cv_type,
-    use_h5py=False,
-):
-    byte_str = client.Get(path)
-    try:
-        if not use_h5py:
-            raw_array = np.fromstring(byte_str, np.uint8)
-            data = cv2.imdecode(raw_array, cv_type)
-        else:
-            f = io.BytesIO(byte_str)
-            data = np.array(h5py.File(f, 'r')['/depth'])
-    except Exception as ex:
-        print(f"==> Data loading failure: {path}")
-        raise ex
-
-    assert data is not None
-    return data
-
-
-def imread_gray(path, augment_fn=None, client=SCANNET_CLIENT):
-    cv_type = cv2.IMREAD_GRAYSCALE if augment_fn is None \
-                else cv2.IMREAD_COLOR
-    if str(path).startswith('s3://'):
-        image = load_array_from_s3(str(path), client, cv_type)
-    else:
-        image = cv2.imread(str(path), 1)
+def imread_gray(path, augment_fn=None):
+    
+    image = cv2.imread(str(path), 1)
 
     if augment_fn is not None:
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
@@ -119,7 +79,7 @@ def read_megadepth_gray(path, resize=None, df=None, padding=False, augment_fn=No
         scale (torch.tensor): [w/w_new, h/h_new]        
     """
     # read image
-    image = imread_gray(path, augment_fn, client=MEGADEPTH_CLIENT)
+    image = imread_gray(path, augment_fn)
 
     # resize image
     w, h = image.shape[1], image.shape[0]
@@ -149,12 +109,55 @@ def read_megadepth_gray(path, resize=None, df=None, padding=False, augment_fn=No
 
 
 def read_megadepth_depth(path, pad_to=None):
-
-    if str(path).startswith('s3://'):
-        depth = load_array_from_s3(path, MEGADEPTH_CLIENT, None, use_h5py=True)
-    else:
-        depth = np.array(h5py.File(path, 'r')['depth'])
+   
+    depth = np.array(h5py.File(path, 'r')['depth'])
     if pad_to is not None:
         depth, _ = pad_bottom_right(depth, pad_to, ret_mask=False)
     depth = torch.from_numpy(depth).float()  # (h, w)
     return depth
+
+
+
+def sample_map_at_coords(fmap, coords, H, W, mode='bilinear'):
+    """
+    fmap:   [1, C, Hc, Wc]
+    coords: [N, 2]  (原图坐标)
+    H, W:   原图尺寸
+    mode:   'bilinear' or 'nearest'
+    """
+
+    device = fmap.device
+    coords = coords.to(device).float()
+
+    # ===== ⭐ 1. 先缩放到 feature map 尺度 =====
+    _, _, Hc, Wc = fmap.shape
+    coords = coords.clone()
+    coords[..., 0] = coords[..., 0] * (Wc / W)
+    coords[..., 1] = coords[..., 1] * (Hc / H)
+
+    if mode == 'nearest':
+        coords_nn = coords.round().long()
+        coords_nn[..., 0] = coords_nn[..., 0].clamp(0, Wc - 1)
+        coords_nn[..., 1] = coords_nn[..., 1].clamp(0, Hc - 1)
+        sampled = fmap[0, :, coords_nn[:, 1], coords_nn[:, 0]]  # [C, N]
+        return sampled.transpose(0, 1)
+
+    # ===== 2. 再 normalize 到 [-1,1] =====
+    coords_norm = coords.clone()
+    coords_norm[..., 0] = coords_norm[..., 0] / (Wc - 1) * 2 - 1
+    coords_norm[..., 1] = coords_norm[..., 1] / (Hc - 1) * 2 - 1
+
+    # ===== 3. reshape =====
+    coords_norm = coords_norm.unsqueeze(0).unsqueeze(2)  # [1, N, 1, 2]
+
+    # ===== 4. grid_sample =====
+    sampled = F.grid_sample(
+        fmap, coords_norm,
+        mode=mode,
+        align_corners=True
+    )  # [1, C, N, 1]
+
+    # ===== 5. reshape → [N,C] =====
+    sampled = sampled.squeeze(0).squeeze(-1).transpose(0, 1)
+
+    return sampled

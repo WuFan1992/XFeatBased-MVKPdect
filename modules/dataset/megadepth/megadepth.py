@@ -1,31 +1,40 @@
-"""
-	"XFeat: Accelerated Features for Lightweight Image Matching, CVPR 2024."
-	https://www.verlab.dcc.ufmg.br/descriptors/xfeat_cvpr24/
-
-    MegaDepth data handling was adapted from 
-    LoFTR official code: https://github.com/zju3dv/LoFTR/blob/master/src/datasets/megadepth.py
-"""
-
 import os.path as osp
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+from collections import defaultdict
 import glob
 from modules.dataset.megadepth.utils import read_megadepth_gray, read_megadepth_depth, fix_path_from_d2net
 import numpy.random as rnd
 
-import pdb, tqdm, os
 
-# 生成有几何约束的图像对
-# 能计算真实GT 的匹配点
+
+"""
+从一系列megadepth 匹配图里得到5个同一个view 下对应点信息的方法如下
+选一个 anchor 图 I0：
+
+在 I0 上采样 grid 点
+    用 warp_kpts：
+        I0 → I1
+        I0 → I2
+        I0 → I3
+        I0 → I4
+    对每个点做：
+        valid = valid_01 & valid_02 & valid_03 & valid_04
+        👉 只保留 在5张图都可见的点
+
+"""
+
+
+
 class MegaDepthDataset(Dataset):
     def __init__(self,
                  root_dir,
                  npz_path,
                  mode='train',
                  min_overlap_score = 0.3, #0.3,
-                 max_overlap_score = 1.0, #1,
+                 max_overlap_score = 0.8, #1,
                  load_depth = True,
                  img_resize = (800,608), #or None
                  df=32,
@@ -76,6 +85,13 @@ class MegaDepthDataset(Dataset):
         del self.scene_info['pair_infos']
         self.pair_infos = [pair_info for pair_info in self.pair_infos if pair_info[1] > min_overlap_score and pair_info[1] < max_overlap_score]
 
+        # Create graph
+        self.graph = defaultdict(list)
+        for (i, j), overlap, _ in self.pair_infos:
+            self.graph[i].append((j, overlap))
+            self.graph[j].append((i, overlap))
+
+
         # parameters for image resizing, padding and depthmap padding
         if mode == 'train':
             assert img_resize is not None #and img_padding and depth_padding
@@ -84,109 +100,99 @@ class MegaDepthDataset(Dataset):
         self.df = df
         self.img_padding = img_padding
         self.depth_max_size = 2000 if depth_padding else None  # the upperbound of depthmaps size in megadepth.
-
-        # for training LoFTR
-        self.augment_fn = augment_fn if mode == 'train' else None
-        self.coarse_scale = getattr(kwargs, 'coarse_scale', 0.125)
-        #pdb.set_trace()
+        self.min_overlap_score = min_overlap_score
+        self.max_overlap_score = max_overlap_score
+        
+        
         # 兼容 D2 Net 的路径格式
         for idx in range(len(self.scene_info['image_paths'])):
             self.scene_info['image_paths'][idx] = fix_path_from_d2net(self.scene_info['image_paths'][idx])
 
         for idx in range(len(self.scene_info['depth_paths'])):
             self.scene_info['depth_paths'][idx] = fix_path_from_d2net(self.scene_info['depth_paths'][idx])
+        
+    
+    # Sample 5 views from 
+    def sample_five_views(self, anchor):
+        neighbors = [j for j, o in self.graph[anchor] if o > self.min_overlap_score and o < self.max_overlap_score  ]
+        
+        
+        if len(neighbors) < 4:
+            return None
+
+        selected = np.random.choice(neighbors, 4, replace=False)
+        return [anchor] + list(selected)
 
 
     def __len__(self):
         return len(self.pair_infos)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, subset_views=None):
+        """
+        subset_views: int, optional
+            如果为 None，返回 5-view。
+            如果为 4/3/2，则从采样到的 5-view 中随机选择 subset_views 个。
+        """
         (idx0, idx1), overlap_score, central_matches = self.pair_infos[idx % len(self)]
+    
+        anchor = idx0
+        # 1. 先采样 5 张 view
+        ids_5 = self.sample_five_views(anchor)
+        if ids_5 is None:
+            return self.__getitem__(np.random.randint(len(self)), subset_views=subset_views)
+    
+        # 2. 如果需要子集，从5-view里随机选择
+        if subset_views is not None and subset_views < len(ids_5):
+            ids = list(np.random.choice(ids_5, subset_views, replace=False))
+            # 保证 anchor 一定在子集里
+            if anchor not in ids:
+                ids[0] = anchor
+        else:
+            ids = ids_5
 
-        # read grayscale image and mask. (1, h, w) and (h, w)
-        img_name0 = osp.join(self.root_dir, self.scene_info['image_paths'][idx0])
-        img_name1 = osp.join(self.root_dir, self.scene_info['image_paths'][idx1])
-        
-        # TODO: Support augmentation & handle seeds for each worker correctly.
-        image0, mask0, scale0 = read_megadepth_gray(
-            img_name0, self.img_resize, self.df, self.img_padding, None)
-            # np.random.choice([self.augment_fn, None], p=[0.5, 0.5]))
-        image1, mask1, scale1 = read_megadepth_gray(
-            img_name1, self.img_resize, self.df, self.img_padding, None)
-            # np.random.choice([self.augment_fn, None], p=[0.5, 0.5]))
+        # 3. 读取 images / depth / Ks / poses / scales / masks
+        images, depths, Ks, poses, scales, masks = [], [], [], [], [], []
 
-        if self.load_depth:
-            # read depth. shape: (h, w)
-            if self.mode in ['train', 'val']:
-                depth0 = read_megadepth_depth(
-                    osp.join(self.root_dir, self.scene_info['depth_paths'][idx0]), pad_to=self.depth_max_size)
-                depth1 = read_megadepth_depth(
-                    osp.join(self.root_dir, self.scene_info['depth_paths'][idx1]), pad_to=self.depth_max_size)
+        for i in ids:
+            img_path = osp.join(self.root_dir, self.scene_info['image_paths'][i])
+            image, mask, scale = read_megadepth_gray(img_path, self.img_resize, self.df, self.img_padding, None)
+            images.append(image)
+            scales.append(scale)
+            # 保存mask：如果img_padding为True则mask非空，否则创建全1 mask
+            if mask is not None:
+                masks.append(mask)
             else:
-                depth0 = depth1 = torch.tensor([])
+                # 如果没有padding，mask默认为全1（所有像素都有效）
+                masks.append(torch.ones(image.shape[1:], dtype=torch.bool))
 
-            # read intrinsics of original size
-            K_0 = torch.tensor(self.scene_info['intrinsics'][idx0].copy(), dtype=torch.float).reshape(3, 3)
-            K_1 = torch.tensor(self.scene_info['intrinsics'][idx1].copy(), dtype=torch.float).reshape(3, 3)
+            if self.load_depth:
+                depth = read_megadepth_depth(
+                    osp.join(self.root_dir, self.scene_info['depth_paths'][i]),
+                    pad_to=self.depth_max_size)
+                depths.append(depth)
 
-            # read and compute relative poses
-            T0 = self.scene_info['poses'][idx0]
-            T1 = self.scene_info['poses'][idx1]
-            T_0to1 = torch.tensor(np.matmul(T1, np.linalg.inv(T0)), dtype=torch.float)[:4, :4]  # (4, 4)
-            T_1to0 = T_0to1.inverse()
+            Ks.append(torch.tensor(self.scene_info['intrinsics'][i], dtype=torch.float).reshape(3, 3))
+            poses.append(self.scene_info['poses'][i])
 
-            data = {
-                'image0': image0,  # (1, h, w)
-                'depth0': depth0,  # (h, w)
-                'image1': image1,
-                'depth1': depth1,
-                'T_0to1': T_0to1,  # (4, 4)
-                'T_1to0': T_1to0,
-                'K0': K_0,  # (3, 3)
-                'K1': K_1,
-                'scale0': scale0,  # [scale_w, scale_h]
-                'scale1': scale1,
-                'dataset_name': 'MegaDepth',
-                'scene_id': self.scene_id,
-                'pair_id': idx,
-                'pair_names': (self.scene_info['image_paths'][idx0], self.scene_info['image_paths'][idx1]),
-            }
+        # 4. 计算相对变换
+        T0 = poses[0]
+        T_0to = []
+        for i in range(len(poses)):
+            Ti = poses[i]
+            T = torch.tensor(np.matmul(Ti, np.linalg.inv(T0)), dtype=torch.float)[:4, :4]
+            T_0to.append(T)
 
-            # for LoFTR training
-            # 将mask 下采样到coarse 分辨率的大小
-            if mask0 is not None:  # img_padding is True
-                if self.coarse_scale:
-                    [ts_mask_0, ts_mask_1] = F.interpolate(torch.stack([mask0, mask1], dim=0)[None].float(),
-                                                        scale_factor=self.coarse_scale,
-                                                        mode='nearest',
-                                                        recompute_scale_factor=False)[0].bool()
-                data.update({'mask0': ts_mask_0, 'mask1': ts_mask_1})
-
-        else:  # 没有
-            
-            # read intrinsics of original size
-            K_0 = torch.tensor(self.scene_info['intrinsics'][idx0].copy(), dtype=torch.float).reshape(3, 3)
-            K_1 = torch.tensor(self.scene_info['intrinsics'][idx1].copy(), dtype=torch.float).reshape(3, 3)
-
-            # read and compute relative poses
-            T0 = self.scene_info['poses'][idx0]
-            T1 = self.scene_info['poses'][idx1]
-            T_0to1 = torch.tensor(np.matmul(T1, np.linalg.inv(T0)), dtype=torch.float)[:4, :4]  # (4, 4)
-            T_1to0 = T_0to1.inverse()
-
-            data = {
-                'image0': image0,  # (1, h, w)
-                'image1': image1,
-                'T_0to1': T_0to1,  # (4, 4)
-                'T_1to0': T_1to0,
-                'K0': K_0,  # (3, 3)
-                'K1': K_1,
-                'scale0': scale0,  # [scale_w, scale_h]
-                'scale1': scale1,
-                'dataset_name': 'MegaDepth',
-                'scene_id': self.scene_id,
-                'pair_id': idx,
-                'pair_names': (self.scene_info['image_paths'][idx0], self.scene_info['image_paths'][idx1]),
-            }
-
+        data = {
+            'images': images,
+            'image_masks': masks,  # 新增：有效区域掩码
+            'depths': depths,
+            'Ks': Ks,
+            'T_0to': T_0to,
+            'T': poses,
+            'scales': scales,
+            'dataset_name': 'MegaDepth',
+            'scene_id': self.scene_id,
+            'view_ids': ids,
+            'all_5view_ids': ids_5  # 可以保留完整5-view的信息
+        }
         return data

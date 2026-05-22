@@ -63,7 +63,8 @@ from modules.training.utils import *
 from modules.training.losses import *
 
 from modules.dataset.megadepth.megadepth import MegaDepthDataset
-from modules.dataset.megadepth import megadepth_warper
+from modules.dataset.megadepth.megadepth_warper import *
+from modules.dataset.megadepth.utils import *
 from torch.utils.data import Dataset, DataLoader
 
 
@@ -142,6 +143,25 @@ class Trainer():
         self.ckpt_save_path = ckpt_save_path
         self.writer = SummaryWriter(ckpt_save_path + f'/logdir/{model_name}_' + time.strftime("%Y_%m_%d-%H_%M_%S"))
         self.model_name = model_name
+        
+    def _get_sample_data(self, batch_data, b):
+        sample_data = {}
+        for key, value in batch_data.items():
+            if isinstance(value, list):
+                if len(value) == 0:
+                    sample_data[key] = []
+                elif isinstance(value[0], torch.Tensor):
+                    sample_data[key] = [v[b] for v in value]
+                else:
+                    sample_data[key] = value[b]
+            elif isinstance(value, torch.Tensor):
+                sample_data[key] = value[b]
+            else:
+                try:
+                    sample_data[key] = value[b]
+                except Exception:
+                    sample_data[key] = value
+        return sample_data
 
 
     def train(self):
@@ -149,9 +169,12 @@ class Trainer():
         self.net.train()
 
         difficulty = 0.10
+        subset_views_list = [5, 4, 3, 2]
+        desc_weights = {5: 1.0, 4: 1.0, 3: 1.0, 2: 1.0}
 
         p1s, p2s, H1, H2 = None, None, None, None
         d = None
+
 
         if self.augmentor is not None: # 使用COCO 合成的图片
             p1s, p2s, H1, H2 = make_batch(self.augmentor, difficulty)
@@ -173,94 +196,106 @@ class Trainer():
                             self.data_iter = iter(self.data_loader)
                             d = next(self.data_iter)
 
-                    if self.augmentor is not None:
-                        #Grab synthetic data
-                        p1s, p2s, H1, H2 = make_batch(self.augmentor, difficulty)
-
-                if d is not None:
-                    for k in d.keys():
-                        if isinstance(d[k], torch.Tensor):
-                            d[k] = d[k].to(self.dev)
                 
-                    p1, p2 = d['image0'], d['image1']
-                    positives_md_coarse = megadepth_warper.spvs_coarse(d, 8)
+                loss_desc_total, valid_batch = 0.0, 0
+                loss_hmap_total = 0.0
+                loss_kpts_total = 0.0
 
-                if self.augmentor is not None:
-                    h_coarse, w_coarse = p1s[0].shape[-2] // 8, p1s[0].shape[-1] // 8
-                    _ , positives_s_coarse = get_corresponding_pts(p1s, p2s, H1, H2, self.augmentor, h_coarse, w_coarse)
+                for b in range(self.batch_size):
+                    
+                    sample_data = self._get_sample_data(d, b)
+                    sample_images = sample_data['images']
+                    H_orig, W_orig = sample_images[0].shape[1:]
+                    
+                    # ===== 生成互斥子集 =====
+                    batch_points_dict, id_to_idx = generate_exclusive_subsets(sample_data)
+                    
+                    # ====== forward 每个view =====
+                    V = len(sample_images)
+                    feats, kpts, hmap, vars = [], [], [], []
+                    for v in range(V):
+                        img = sample_images[v]
+                        if img.dim() == 3:
+                            img = img.unsqueeze(0)
+                        feat_v, kpt_v, hmap_v, var_v = self.net(img.to(self.dev))
+                        feats.append(feat_v)
+                        kpts.append(kpt_v)
+                        hmap.append(hmap_v)
+                        vars.append(var_v)
+                        
+                        # ==== 对每个view 的子集计算loss =====
+                    for k in subset_views_list:
+                        subset_ids, (corrs_k, vis_k) = batch_points_dict[k]
+                        N_points = corrs_k.shape[0]
 
-                #Join megadepth & synthetic data
-                with torch.no_grad():
+                        # ==== 限制最小点数 =====
+                        if N_points < 10:
+                            continue
+                            
+                        # ===== 限制最大点数 =====
+                        max_points = 5000
+                        if N_points > max_points:
+                            idx = torch.randperm(N_points)[:max_points]
+                            corrs_k = corrs_k[idx]
+                            vis_k = vis_k[idx]
+                                
+                        # ===== 采样 multi-view 特征 =====
+                        feat_per_point, hmap_per_point, kpts_per_point = [], [], []
+                        for v in range(k):
+                            coords = corrs_k[:, v, :].to(self.dev)
+                            # 采样描述子
 
+                            feat_sample = sample_map_at_coords(feats[v], coords, H_orig, W_orig)
+                            hmap_sample = sample_map_at_coords(hmap[v], coords, H_orig, W_orig)
+                            kpts_sample = sample_map_at_coords(kpts[v], coords, H_orig, W_orig) 
+                                
+                            feat_per_point.append(feat_sample)
+                            hmap_per_point.append(hmap_sample)
+                            kpts_per_point.append(kpts_sample)
+                                
+                        # stack → [N_points, k, C]
+                        stacked_feats = torch.stack(feat_per_point, dim=1)
+                        stacked_hmaps = torch.stack(hmap_per_point, dim=1)
+                        stacked_kpts = torch.stack(kpts_per_point, dim=1)
+                            
+                        # ===== visibility mask =====
+                        visibility = torch.ones((N_points, k), device=self.dev, dtype=torch.bool) if vis_k is None else vis_k.bool().to(self.dev)
+                            
+                        # ===== 计算 multi-view loss =====
+                        loss_desc_b = loss = mv_infonce_masked(stacked_feats, visibility, tau=0.2)
+                        loss_desc_total += desc_weights[k] * loss_desc_b
+                            
+                        # ===== 计算 reliability loss =====
+                        loss_hmap_b = multi_view_xfeat_heatmap_loss(
+                                    stacked_hmaps,
+                                    stacked_kpts,
+                                    visibility,
+                                    tau=0.2
+                        )
+                        loss_hmap_total += desc_weights[k] * loss_hmap_b
+                            
+                        # ===== kpts loss =====
+                        loss_kpts_b = 0.0
+                        for v in range(k):
+                            pred_hm = kpts[v]  # [1, 65, H/8, W/8]
+                            img_v = d['images'][v]  # [3, H_orig, W_orig] or [1,...]
+                            loss_hm_v, acc_hm_v = alike_distill_loss(pred_hm[0], img_v[0])
+                            loss_kpts_b += loss_hm_v
 
-                    #Cat two batches
-                    if self.model_name in ('vudnet_default'):
-                        p1 = torch.cat([p1s, p1], dim=0)
-                        p2 = torch.cat([p2s, p2], dim=0)
-                        positives_c = positives_s_coarse + positives_md_coarse
-                    elif self.model_name in ('vudnet_synthetic'):
-                        p1 = p1s ; p2 = p2s
-                        positives_c = positives_s_coarse
-                    else:
-                        positives_c = positives_md_coarse
+                        loss_kpts_total += loss_kpts_b / k
+                        valid_batch += 1
 
-                #Check if batch is corrupted with too few correspondences
-                is_corrupted = False
-                for p in positives_c:
-                    if len(p) < 30:
-                        is_corrupted = True
+                loss_desc = loss_desc_total / valid_batch if valid_batch > 0 else torch.tensor(0.0, device=self.dev, requires_grad=True)
+                loss_hmap = loss_hmap_total / valid_batch if valid_batch > 0 else torch.tensor(0.0, device=self.dev, requires_grad=True)
+                loss_kpts = loss_kpts_total / valid_batch if valid_batch > 0 else torch.tensor(0.0, device=self.dev, requires_grad=True)
+            
 
-                if is_corrupted:
-                    continue
-
-                #Forward pass
-                feats1, kpts1, hmap1, vars1 = self.net(p1)
-                feats2, kpts2, hmap2, vars2 = self.net(p2)
-
-                loss_items = []
-
-                for b in range(len(positives_c)):
-                    #Get positive correspondencies
-                    pts1, pts2 = positives_c[b][:, :2], positives_c[b][:, 2:]
-
-                    #Grab features at corresponding idxs   feats1 size = [B, C, Hc, Wc]
-                    m1 = feats1[b, :, pts1[:,1].long(), pts1[:,0].long()].permute(1,0) # 从特征图里面采样descriptor   [M,C]
-                    m2 = feats2[b, :, pts2[:,1].long(), pts2[:,0].long()].permute(1,0)
-
-                    #grab heatmaps at corresponding idxs   hmap.shape = [B, 1, Hc, Wc] 
-                    h1 = hmap1[b, 0, pts1[:,1].long(), pts1[:,0].long()]
-                    h2 = hmap2[b, 0, pts2[:,1].long(), pts2[:,0].long()]
-
-
-                    #Compute losses
-                    loss_ds, conf = dual_softmax_loss(m1, m2)
-                    #loss_coords, acc_coords = coordinate_classification_loss(coords1, pts1, pts2, conf)
-
-                    loss_kp_pos1, acc_pos1 = alike_distill_loss(kpts1[b], p1[b])
-                    loss_kp_pos2, acc_pos2 = alike_distill_loss(kpts2[b], p2[b])
-                    loss_kp_pos = (loss_kp_pos1 + loss_kp_pos2)*2.0
-                    acc_pos = (acc_pos1 + acc_pos2)/2
-
-                    loss_kp =  keypoint_loss(h1, conf) + keypoint_loss(h2, conf)
-
-                    loss_items.append(loss_ds.unsqueeze(0))
-                    #loss_items.append(loss_coords.unsqueeze(0))
-                    loss_items.append(loss_kp.unsqueeze(0))
-                    loss_items.append(loss_kp_pos.unsqueeze(0))
-
-                    if b == 0:
-                        acc_coarse_0 = check_accuracy(m1, m2)
-
-                acc_coarse = check_accuracy(m1, m2)
-
-                nb_coarse = len(m1)
-                loss = torch.cat(loss_items, -1).mean() # 把所有的loss 都压平在一个list 里面，最后求平均值即可
-                loss_coarse = loss_ds.item()
-                #loss_coord = loss_coords.item()
-                #loss_coord = loss_coords.item()
-                loss_kp_pos = loss_kp_pos.item()
-                loss_l1 = loss_kp.item()
-
+                # ===== 总 loss =====
+                loss = (
+                loss_desc
+                + 1.0 * loss_hmap      # 增加 reliability 权重，更接近 XFeat supervision
+                + 1.0 * loss_kpts
+                )
                 # Compute Backward Pass
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.)
@@ -271,21 +306,16 @@ class Trainer():
                 if (i+1) % self.save_ckpt_every == 0:
                     print('saving iter ', i+1)
                     torch.save(self.net.state_dict(), self.ckpt_save_path + f'/{self.model_name}_{i+1}.pth')
-                pbar.set_description( 'Loss: {:.4f} acc_c0 {:.3f} acc_c1 {:.3f}  loss_c: {:.3f}  loss_kp: {:.3f} #matches_c: {:d} loss_kp_pos: {:.3f} acc_kp_pos: {:.3f}'.format(
-                                                                        loss.item(), acc_coarse_0, acc_coarse, loss_coarse, loss_l1, nb_coarse, loss_kp_pos, acc_pos) )
+                pbar.set_description( 'Loss: {:.4f}  loss_c: {:.3f}  loss_kp: {:.3f}  loss_kp_pos: {:.3f} '.format(
+                                                                        loss.item(),  loss_desc, loss_hmap, loss_kpts) )
                 pbar.update(1)
 
                 # Log metrics
                 self.writer.add_scalar('Loss/total', loss.item(), i)
-                self.writer.add_scalar('Accuracy/coarse_synth', acc_coarse_0, i)
-                self.writer.add_scalar('Accuracy/coarse_mdepth', acc_coarse, i)
-                #self.writer.add_scalar('Accuracy/fine_mdepth', acc_coords, i)
-                self.writer.add_scalar('Accuracy/kp_position', acc_pos, i)
-                self.writer.add_scalar('Loss/coarse', loss_coarse, i)
+                self.writer.add_scalar('Loss/coarse', loss_desc, i)
                 #self.writer.add_scalar('Loss/fine', loss_coord, i)
-                self.writer.add_scalar('Loss/reliability', loss_l1, i)
-                self.writer.add_scalar('Loss/keypoint_pos', loss_kp_pos, i)
-                self.writer.add_scalar('Count/matches_coarse', nb_coarse, i)
+                self.writer.add_scalar('Loss/reliability', loss_hmap, i)
+                self.writer.add_scalar('Loss/keypoint_pos', loss_kpts, i)
 
 
 

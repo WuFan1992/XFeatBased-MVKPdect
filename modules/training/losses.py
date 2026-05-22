@@ -7,6 +7,69 @@ from modules.training import utils
 
 from third_party.alike_wrapper import extract_alike_kpts
 
+
+def mv_infonce_masked(f_inv, visibility, tau=0.2):
+    """
+    Multi-View InfoNCE with intra-view negatives:
+    - cross-view positive: corresponding points in different views
+    - cross-view negative: non-corresponding points in different views  
+    - intra-view negative: other points in same view (prevents feature collapse)
+    
+    Args:
+        f_inv: [N, V, C] feature descriptors
+        visibility: [N, V] visibility mask (bool)
+        tau: temperature parameter
+    
+    Returns:
+        loss: scalar loss value
+    """
+    N, V, C = f_inv.shape
+    f = F.normalize(f_inv, dim=2)
+
+    loss = 0.0
+    count = 0
+
+    for i in range(V):
+        for j in range(i + 1, V):
+            mask = visibility[:, i] & visibility[:, j]
+            if mask.sum() < 10:
+                continue
+
+            fi = f[mask, i]   # [M, C]
+            fj = f[mask, j]   # [M, C]
+
+            M = fi.shape[0]
+
+            # ===== cross-view similarity =====
+            sim_cross = fi @ fj.t() / tau   # [M, M], 对角线为正样本
+
+            # ===== intra-view similarity =====
+            sim_intra_i = fi @ fi.t() / tau
+            sim_intra_j = fj @ fj.t() / tau
+
+            # ===== mask掉对角线（避免自己当negative）=====
+            diag_mask = torch.eye(M, device=fi.device, dtype=torch.bool)
+            sim_intra_i = sim_intra_i.masked_fill(diag_mask, float('-inf'))
+            sim_intra_j = sim_intra_j.masked_fill(diag_mask, float('-inf'))
+
+            # ===== 拼接 logits =====
+            logits_i = torch.cat([sim_cross, sim_intra_i], dim=1)  # [M, 2M]
+            logits_j = torch.cat([sim_cross.t(), sim_intra_j], dim=1)
+
+            labels = torch.arange(M, device=fi.device)
+
+            loss_i = F.cross_entropy(logits_i, labels, reduction='mean')
+            loss_j = F.cross_entropy(logits_j, labels, reduction='mean')
+            
+            loss += loss_i + loss_j
+            count += 2
+
+    if count == 0:
+        return torch.tensor(0.0, device=f.device, requires_grad=True)
+
+    return loss / count
+
+
 def dual_softmax_loss(X, Y, temp = 0.2):
     if X.size() != Y.size() or X.dim() != 2 or Y.dim() != 2:
         raise RuntimeError('Error: X and Y shapes must match and be 2D matrices')
@@ -222,3 +285,81 @@ def hard_triplet_loss(X,Y, margin = 0.5):
     loss = torch.clamp(margin + dist_pos - hard_neg, min=0.)
 
     return loss.mean()
+
+
+def multi_view_xfeat_heatmap_loss(
+    hmaps,
+    feats,
+    visibility,
+    tau=0.2,
+    eps=1e-6
+    ):
+    """
+    Multi-view XFeat-style heatmap supervision.
+
+    ```
+    Args:
+        hmaps: [N, V, 1]
+        feats: [N, V, C]
+        visibility: [N, V]
+
+    Returns:
+        loss
+    """
+
+    N, V, C = feats.shape
+
+    feats = F.normalize(feats, dim=-1)
+
+    total_loss = 0.0
+    total_pairs = 0
+
+    for i in range(V):
+
+        for j in range(i + 1, V):
+
+            mask = visibility[:, i] & visibility[:, j]
+
+            idx = mask.nonzero(as_tuple=False).squeeze(-1)
+
+            if len(idx) < 10:
+                continue
+
+            fi = feats[idx, i]
+            fj = feats[idx, j]
+
+            # similarity matrix
+            sim = (fi @ fj.t()) / tau
+
+            # dual softmax
+            prob12 = F.softmax(sim, dim=1)
+            prob21 = F.softmax(sim.t(), dim=1)
+
+            # XFeat confidence
+            conf12 = prob12.max(dim=1)[0]
+            conf21 = prob21.max(dim=1)[0]
+
+            conf = (conf12 * conf21).detach()
+
+            hi = torch.sigmoid(hmaps[idx, i, 0])
+            hj = torch.sigmoid(hmaps[idx, j, 0])
+
+            # supervise BOTH views
+            loss_i = F.l1_loss(hi, conf)
+            loss_j = F.l1_loss(hj, conf)
+
+            total_loss += loss_i + loss_j
+            total_pairs += 2
+
+    if total_pairs == 0:
+        return torch.tensor(
+            0.0,
+            device=feats.device,
+            requires_grad=True
+        )
+
+    return total_loss / total_pairs
+
+
+
+
