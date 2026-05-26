@@ -145,13 +145,104 @@ def generate_multiview_subsets_noexclude(batch_data, subset_views_list=[5,4,3,2]
 # 1️⃣ 生成完整 5-view 对应点
 # ================================
 @torch.no_grad()
+def generate_pairwise_corrs_independent(data, view_idx0, view_idx1, scale=8, cycle_thresh=1.5):
+    """
+    为单个view对(view_idx0, view_idx1)独立生成对应点，不受其他view限制。
+    
+    Args:
+        data: dict, 包含 keys 'images', 'depths', 'Ks', 'T_0to', 'scales', 'image_masks'
+        view_idx0, view_idx1: 两个view的索引
+        scale: 下采样比例
+        cycle_thresh: cycle consistency 阈值
+    
+    Returns:
+        corrs_pair: torch.Tensor, [num_points, 2, 2] 两个view的对应坐标
+        vis_pair: torch.Tensor, [num_points, 2] 两个view的可见性掩码
+    """
+    device = data['images'][0].device
+    
+    images = [img.unsqueeze(0) if img.dim()==3 else img for img in data['images']]
+    depths = [d.unsqueeze(0) if d.dim()==2 else d for d in data['depths']]
+    Ks = [K.unsqueeze(0) if K.dim()==2 else K for K in data['Ks']]
+    T_0to = [T.unsqueeze(0) if T.dim()==2 else T for T in data['T_0to']]
+    scales = [torch.tensor([s], device=device) if not isinstance(s, torch.Tensor) else s for s in data['scales']]
+    
+    masks = data.get('image_masks', None)
+    if masks is not None:
+        masks = [m.to(device) if isinstance(m, torch.Tensor) else torch.from_numpy(m).to(device) for m in masks]
+    
+    # ===== 1. reference grid on view0 =====
+    _, _, H, W = images[view_idx0].shape
+    h, w = H // scale, W // scale
+    grid = create_meshgrid(h, w, False, device).reshape(1, h*w, 2)
+    grid_0 = grid * scale  # 原图坐标
+    
+    # ===== 2. warp from view0 to view1 with cycle consistency =====
+    valid_fw, warped_01 = warp_kpts(grid_0, depths[view_idx0], depths[view_idx1], 
+                                     T_0to[view_idx1], Ks[view_idx0], Ks[view_idx1])
+    
+    # Inverse transform: view1 -> view0
+    T_1to0 = torch.inverse(T_0to[view_idx1])
+    valid_bw, warped_10 = warp_kpts(warped_01, depths[view_idx1], depths[view_idx0], 
+                                     T_1to0, Ks[view_idx1], Ks[view_idx0])
+    
+    # ===== 3. cycle consistency check =====
+    dist = torch.norm(grid_0 - warped_10, dim=-1)
+    mask_cycle = dist < cycle_thresh
+    valid_pair = valid_fw & valid_bw & mask_cycle  # [1, h*w]
+    
+    if valid_pair[0].sum() == 0:
+        empty_corrs = torch.empty((0, 2, 2), device=device)
+        empty_vis = torch.empty((0, 2), dtype=torch.bool, device=device)
+        return empty_corrs, empty_vis
+    
+    # ===== 4. extract valid points =====
+    final_mask = valid_pair[0]
+    pts_0 = grid_0[0, final_mask]  # [N, 2]
+    pts_1 = warped_01[0, final_mask]  # [N, 2]
+    
+    # ===== 5. scale back to original image =====
+    pts_0[:, 0] /= scales[view_idx0][0]
+    pts_0[:, 1] /= scales[view_idx0][1]
+    pts_1[:, 0] /= scales[view_idx1][0]
+    pts_1[:, 1] /= scales[view_idx1][1]
+    
+    # ===== 6. stack as [N, 2, 2] =====
+    corrs_pair = torch.stack([pts_0, pts_1], dim=1)  # [N, 2, 2]
+    
+    # ===== 7. visibility mask for each view =====
+    N_points = corrs_pair.shape[0]
+    vis_pair = torch.ones((N_points, 2), dtype=torch.bool, device=device)
+    
+    if masks is not None:
+        for local_v, global_v in [(0, view_idx0), (1, view_idx1)]:
+            mask_v = masks[global_v]  # [H, W]
+            H_mask, W_mask = mask_v.shape
+            coords_v = corrs_pair[:, local_v, :].long()
+            
+            in_bounds = (coords_v[:, 0] >= 0) & (coords_v[:, 0] < W_mask) & \
+                       (coords_v[:, 1] >= 0) & (coords_v[:, 1] < H_mask)
+            
+            valid_coords = in_bounds.clone()
+            for j in range(N_points):
+                if in_bounds[j]:
+                    x, y = coords_v[j, 0].item(), coords_v[j, 1].item()
+                    valid_coords[j] = mask_v[y, x] > 0.5
+            
+            vis_pair[:, local_v] = valid_coords
+    
+    return corrs_pair, vis_pair
+
+
+@torch.no_grad()
 def generate_multi_corrs_from_data(data, scale=8, cycle_thresh=1.5):
     """
-    从 data (5-view) 中生成 multi-view 对应点坐标。
+    从 data 中生成 multi-view 对应点坐标，为所有view对独立生成对应点。
+    每个点必须在所有view中都有效（作为"锚点"）。
+    对于需要每对view的独立对应点集，使用 generate_pairwise_corrs_independent。
 
     Args:
         data: dict, 包含 keys 'images', 'depths', 'Ks', 'T_0to', 'scales', 'image_masks'
-              每个 key 是 list of length V (view 数量)
         scale: 下采样比例
         cycle_thresh: cycle consistency 阈值
 
@@ -160,15 +251,13 @@ def generate_multi_corrs_from_data(data, scale=8, cycle_thresh=1.5):
         vis: torch.Tensor, [num_points, V] bool 掩码，表示每个点在每个view中的有效性
     """
     device = data['images'][0].device
-    B = 1  # 单个 scene
-
+    
     images = [img.unsqueeze(0) if img.dim()==3 else img for img in data['images']]
     depths = [d.unsqueeze(0) if d.dim()==2 else d for d in data['depths']]
     Ks = [K.unsqueeze(0) if K.dim()==2 else K for K in data['Ks']]
     T_0to = [T.unsqueeze(0) if T.dim()==2 else T for T in data['T_0to']]
     scales = [torch.tensor([s], device=device) if not isinstance(s, torch.Tensor) else s for s in data['scales']]
     
-    # 获取masks，用于检查有效区域
     masks = data.get('image_masks', None)
     if masks is not None:
         masks = [m.to(device) if isinstance(m, torch.Tensor) else torch.from_numpy(m).to(device) for m in masks]
@@ -182,7 +271,7 @@ def generate_multi_corrs_from_data(data, scale=8, cycle_thresh=1.5):
     valid_all = torch.ones((1, h*w), dtype=torch.bool, device=device)
     all_points = [grid_i]
 
-    # ===== 2. cycle consistency =====
+    # ===== 2. cycle consistency for each view (多view交集) =====
     V = len(images)
     for i in range(1, V):
         valid_fw, warped_fw = warp_kpts(grid_i, depths[0], depths[i], T_0to[i], Ks[0], Ks[i])
@@ -191,7 +280,7 @@ def generate_multi_corrs_from_data(data, scale=8, cycle_thresh=1.5):
         dist = torch.norm(grid_i - warped_bw, dim=-1)
         mask_cycle = dist < cycle_thresh
         valid = valid_fw & valid_bw & mask_cycle
-        valid_all &= valid
+        valid_all &= valid  # 只保留所有view都有效的点
         all_points.append(warped_fw)
 
     # ===== 3. final filtering =====
@@ -213,25 +302,20 @@ def generate_multi_corrs_from_data(data, scale=8, cycle_thresh=1.5):
     N_points = multi_corrs_5view.shape[0]
     vis = torch.ones((N_points, V), dtype=torch.bool, device=device)
     
-    # 如果有masks，检查坐标是否在有效区域内
     if masks is not None:
         for v in range(V):
             mask_v = masks[v]  # [H, W]
             H_mask, W_mask = mask_v.shape
             
-            # 获取该view的所有坐标
             coords_v = multi_corrs_5view[:, v, :].long()  # [N_points, 2]
             
-            # 检查坐标边界
             in_bounds = (coords_v[:, 0] >= 0) & (coords_v[:, 0] < W_mask) & \
                        (coords_v[:, 1] >= 0) & (coords_v[:, 1] < H_mask)
             
-            # 检查mask值
             valid_coords = in_bounds.clone()
             for j in range(N_points):
                 if in_bounds[j]:
                     x, y = coords_v[j, 0].item(), coords_v[j, 1].item()
-                    # mask值为1表示有效，0表示无效（padding或遮挡）
                     valid_coords[j] = mask_v[y, x] > 0.5
             
             vis[:, v] = valid_coords
