@@ -111,7 +111,9 @@ def generate_exclusive_subsets(batch_data, subset_views_list=[5,4,3,2], scale=4)
             )
            # 如果返回为空，则给空数组
             if multi_corrs_k is None or multi_corrs_k.shape[0] == 0:
-                subset_ids, multi_corrs_k, vis_k = [], np.zeros((0, k, 2)), None
+                subset_ids = []
+                multi_corrs_k = torch.empty((0, k, 2), dtype=torch.float32)
+                vis_k = torch.empty((0, k), dtype=torch.bool)
             else:
                 # 强制 subset_ids 全部为 Python int
                 subset_ids = [int(x) if not isinstance(x, int) else x for x in subset_ids]

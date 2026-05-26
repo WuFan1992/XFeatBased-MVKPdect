@@ -44,17 +44,20 @@ def mv_infonce_masked(f_inv, visibility, tau=0.2):
             sim_cross = fi @ fj.t() / tau   # [M, M], 对角线为正样本
 
             # ===== intra-view similarity =====
-            sim_intra_i = fi @ fi.t() / tau
-            sim_intra_j = fj @ fj.t() / tau
+            #sim_intra_i = fi @ fi.t() / tau
+            #sim_intra_j = fj @ fj.t() / tau
 
             # ===== mask掉对角线（避免自己当negative）=====
-            diag_mask = torch.eye(M, device=fi.device, dtype=torch.bool)
-            sim_intra_i = sim_intra_i.masked_fill(diag_mask, float('-inf'))
-            sim_intra_j = sim_intra_j.masked_fill(diag_mask, float('-inf'))
+            #diag_mask = torch.eye(M, device=fi.device, dtype=torch.bool)
+            #sim_intra_i = sim_intra_i.masked_fill(diag_mask, float('-inf'))
+            #sim_intra_j = sim_intra_j.masked_fill(diag_mask, float('-inf'))
 
             # ===== 拼接 logits =====
-            logits_i = torch.cat([sim_cross, sim_intra_i], dim=1)  # [M, 2M]
-            logits_j = torch.cat([sim_cross.t(), sim_intra_j], dim=1)
+            #logits_i = torch.cat([sim_cross, sim_intra_i], dim=1)  # [M, 2M]
+            #logits_j = torch.cat([sim_cross.t(), sim_intra_j], dim=1)
+            
+            logits_i = sim_cross
+            logits_j = sim_cross.t()
 
             labels = torch.arange(M, device=fi.device)
 
@@ -165,7 +168,8 @@ def alike_distill_loss(kpts, img):
         acc =  (labels == predicted)
         acc = acc.sum() / len(acc)
 
-    kpts = F.log_softmax(kpts)
+    kpts = F.log_softmax(kpts, dim=1)
+    
     loss = F.nll_loss(kpts, labels, reduction = 'mean')
 
     return loss, acc
@@ -263,6 +267,7 @@ def coordinate_classification_loss(coords1, pts1, pts2, conf):
 
 def keypoint_loss(heatmap, target):
     # Compute L1 loss
+    target = target.unsqueeze(1)
     L1_loss = F.l1_loss(heatmap, target)
     return L1_loss * 3.0
 

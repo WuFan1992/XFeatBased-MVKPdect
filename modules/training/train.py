@@ -197,9 +197,10 @@ class Trainer():
                             d = next(self.data_iter)
 
                 
-                loss_desc_total, valid_batch = 0.0, 0
-                loss_hmap_total = 0.0
-                loss_kpts_total = 0.0
+                loss_desc_total = torch.zeros([], device=self.dev)
+                loss_hmap_total = torch.zeros([], device=self.dev)
+                loss_kpts_total = torch.zeros([], device=self.dev)
+                valid_pairs = 0
 
                 for b in range(self.batch_size):
                     
@@ -223,17 +224,12 @@ class Trainer():
                         hmap.append(hmap_v)
                         vars.append(var_v)
                         
-                        # ==== 对每个view 的子集计算loss =====
+                    # ===== 对每个view 的子集生成pairwise对并计算损失 =====
                     for k in subset_views_list:
                         view_ids, (corrs_k, vis_k) = batch_points_dict[k]
                         N_points = corrs_k.shape[0]
-                        
-                        corrs_k = corrs_k.to(self.dev)
-                        vis_k = vis_k.to(self.dev) if vis_k is not None else None
-                        
-                        local_to_global = [id_to_idx[v] for v in view_ids]
-
-                        # ==== 限制最小点数 =====
+                          
+                        # ===== 限制最小点数 =====
                         if N_points < 10:
                             continue
                             
@@ -243,66 +239,84 @@ class Trainer():
                             idx = torch.randperm(N_points)[:max_points]
                             corrs_k = corrs_k[idx]
                             vis_k = vis_k[idx]
-                                
+                        
+                        corrs_k = corrs_k.to(self.dev)
+                        if vis_k is not None:
+                            vis_k = vis_k.to(self.dev)
+                        
+                        local_to_global = [id_to_idx[v] for v in view_ids]
+
                         # ===== 采样 multi-view 特征 =====
-                        feat_per_point, hmap_per_point, kpts_per_point = [], [], []
+                        feat_per_point = []  # [k, N, C]
+                        hmap_per_point = []
+                        kpts_per_point = []
+                        
                         for local_v, global_v in enumerate(local_to_global):
                             coords = corrs_k[:, local_v, :].to(self.dev)
-                            # 采样描述子
-
                             feat_sample = sample_map_at_coords(feats[global_v], coords, H_orig, W_orig)
                             hmap_sample = sample_map_at_coords(hmap[global_v], coords, H_orig, W_orig)
-                            kpts_sample = sample_map_at_coords(kpts[global_v], coords, H_orig, W_orig) 
+                            kpts_sample = sample_map_at_coords(kpts[global_v], coords, H_orig, W_orig)
                                 
                             feat_per_point.append(feat_sample)
                             hmap_per_point.append(hmap_sample)
                             kpts_per_point.append(kpts_sample)
-                                
-                        # stack → [N_points, k, C]
-                        stacked_feats = torch.stack(feat_per_point, dim=1)
-                        stacked_hmaps = torch.stack(hmap_per_point, dim=1)
-                        stacked_kpts = torch.stack(kpts_per_point, dim=1)
-                            
+                        
                         # ===== visibility mask =====
                         visibility = torch.ones((N_points, k), device=self.dev, dtype=torch.bool) if vis_k is None else vis_k.bool().to(self.dev)
-                            
-                        # ===== 计算 multi-view loss =====
-                        loss_desc_b = loss = mv_infonce_masked(stacked_feats, visibility, tau=0.2)
-                        loss_desc_total += desc_weights[k] * loss_desc_b
-                            
-                        # ===== 计算 reliability loss =====
-                        loss_hmap_b = multi_view_xfeat_heatmap_loss(
-                                    stacked_hmaps,
-                                    stacked_kpts,
-                                    visibility,
-                                    tau=0.2
-                        )
-                        loss_hmap_total += desc_weights[k] * loss_hmap_b
-                            
-                        # ===== kpts loss =====
-                        loss_kpts_b = 0.0
+                        
+                        # ===== 生成所有view对并使用 pairwise dual-softmax loss =====
+                        for vi in range(k):
+                            for vj in range(vi + 1, k):
+                                # 获取该对view的有效点（两个view都可见）
+                                mask_ij = visibility[:, vi] & visibility[:, vj]
+                                
+                                if mask_ij.sum() < 10:
+                                    continue
+                                
+                                # 采样该对的特征
+                                feat_i = feat_per_point[vi][mask_ij]  # [M, C]
+                                feat_j = feat_per_point[vj][mask_ij]  # [M, C]
+                                
+                                hmap_i = hmap_per_point[vi][mask_ij]  # [M]
+                                hmap_j = hmap_per_point[vj][mask_ij]  # [M]
+                                
+                                # ===== 计算 pairwise dual-softmax loss =====
+                                loss_desc_pair, conf_pair = dual_softmax_loss(feat_i, feat_j, temp=0.2)
+                                loss_desc_total += loss_desc_pair
+                                
+                                # ===== 计算 reliability/keypoint loss =====
+                                loss_hmap_pair = keypoint_loss(hmap_i, conf_pair) + keypoint_loss(hmap_j, conf_pair)
+                                loss_hmap_total += loss_hmap_pair
+                                
+                                valid_pairs += 1
+                        
+                        # ===== kpts distillation loss（对所有view） =====
+                        loss_kpts_b = torch.zeros([], device=self.dev)
                         cnt = 0.0
                         for local_v, global_v in enumerate(local_to_global):
                             pred_hm = kpts[global_v]  # [1, 65, H/8, W/8]
-                            img_v = d['images'][global_v]  # [3, H_orig, W_orig] or [1,...]
-                            loss_hm_v, acc_hm_v = alike_distill_loss(pred_hm[0], img_v[0])
+                            img_v = sample_images[global_v]  # [3, H_orig, W_orig] or [1,...]
+                            loss_hm_v, acc_hm_v = alike_distill_loss(pred_hm[0], img_v)
                             loss_kpts_b += loss_hm_v
-                            cnt+=1
+                            cnt += 1
 
                         loss_kpts_total += loss_kpts_b / max(cnt, 1)
-                        valid_batch += 1
 
-                loss_desc = loss_desc_total / valid_batch if valid_batch > 0 else torch.tensor(0.0, device=self.dev, requires_grad=True)
-                loss_hmap = loss_hmap_total / valid_batch if valid_batch > 0 else torch.tensor(0.0, device=self.dev, requires_grad=True)
-                loss_kpts = loss_kpts_total / valid_batch if valid_batch > 0 else torch.tensor(0.0, device=self.dev, requires_grad=True)
+                loss_desc = loss_desc_total / max(valid_pairs, 1)
+                loss_hmap = loss_hmap_total / max(valid_pairs, 1)
+                loss_kpts = loss_kpts_total / max(1, self.batch_size)
             
-
                 # ===== 总 loss =====
-                loss = (
-                loss_desc
-                + 1.0 * loss_hmap      # 增加 reliability 权重，更接近 XFeat supervision
-                + 1.0 * loss_kpts
-                )
+                loss = loss_desc + 1.0 * loss_hmap + 1.0 * loss_kpts
+                
+                if valid_pairs == 0:
+                    print(f"[WARN] Iter {i}: no valid pairs")
+                    continue
+
+                if not loss.requires_grad:
+                    print(f"[WARN] Iter {i}: loss has no grad")
+                    continue
+                
                 # Compute Backward Pass
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.)
@@ -313,16 +327,16 @@ class Trainer():
                 if (i+1) % self.save_ckpt_every == 0:
                     print('saving iter ', i+1)
                     torch.save(self.net.state_dict(), self.ckpt_save_path + f'/{self.model_name}_{i+1}.pth')
-                pbar.set_description( 'Loss: {:.4f}  loss_c: {:.3f}  loss_kp: {:.3f}  loss_kp_pos: {:.3f} '.format(
-                                                                        loss.item(),  loss_desc, loss_hmap, loss_kpts) )
+                pbar.set_description( 'Loss: {:.4f}  loss_c: {:.3f}  loss_hm: {:.3f}  loss_kp: {:.3f}  pairs: {} '.format(
+                                                                        loss.item(), loss_desc, loss_hmap, loss_kpts, valid_pairs) )
                 pbar.update(1)
 
                 # Log metrics
                 self.writer.add_scalar('Loss/total', loss.item(), i)
                 self.writer.add_scalar('Loss/coarse', loss_desc, i)
-                #self.writer.add_scalar('Loss/fine', loss_coord, i)
                 self.writer.add_scalar('Loss/reliability', loss_hmap, i)
                 self.writer.add_scalar('Loss/keypoint_pos', loss_kpts, i)
+                self.writer.add_scalar('Metric/valid_pairs', valid_pairs, i)
 
 
 
