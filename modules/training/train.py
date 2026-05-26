@@ -169,8 +169,8 @@ class Trainer():
         self.net.train()
 
         difficulty = 0.10
-        subset_views_list = [5, 4, 3, 2]
-        desc_weights = {5: 1.0, 4: 1.0, 3: 1.0, 2: 1.0}
+        subset_views_list = [5]
+        desc_weights = {5: 1.0}
 
         p1s, p2s, H1, H2 = None, None, None, None
         d = None
@@ -224,110 +224,86 @@ class Trainer():
                         hmap.append(hmap_v)
                         vars.append(var_v)
                         
-                    # ===== 对每个view 的子集生成pairwise对并计算损失 =====
-                    for k in subset_views_list:
-                        view_ids, (corrs_k, vis_k) = batch_points_dict[k]
+                    # ===== 只使用 k=5 的5-view点，按10对独立生成对应点 =====
+                    view_ids, _ = batch_points_dict[5]
+                    if len(view_ids) < 5:
+                        continue
+                    
+                    for vi_local in range(len(view_ids)):
+                        for vj_local in range(vi_local + 1, len(view_ids)):
+                            vi_sample_idx = id_to_idx[view_ids[vi_local]]
+                            vj_sample_idx = id_to_idx[view_ids[vj_local]]
+                            
+                            try:
+                                data_pair = {
+                                    'images': [sample_data['images'][vi_sample_idx], sample_data['images'][vj_sample_idx]],
+                                    'depths': [sample_data['depths'][vi_sample_idx], sample_data['depths'][vj_sample_idx]],
+                                    'Ks': [sample_data['Ks'][vi_sample_idx], sample_data['Ks'][vj_sample_idx]],
+                                    'T_0to': [torch.eye(3, 4, device=self.dev), 
+                                             sample_data['T_0to'][vj_sample_idx] if 'T_0to' in sample_data else torch.eye(3, 4, device=self.dev)],
+                                    'scales': [sample_data['scales'][vi_sample_idx] if 'scales' in sample_data else torch.tensor([1.0, 1.0]),
+                                              sample_data['scales'][vj_sample_idx] if 'scales' in sample_data else torch.tensor([1.0, 1.0])],
+                                }
+                                if 'image_masks' in sample_data:
+                                    data_pair['image_masks'] = [sample_data['image_masks'][vi_sample_idx], 
+                                                               sample_data['image_masks'][vj_sample_idx]]
+                            except (KeyError, IndexError, TypeError):
+                                continue
+                            
+                            corrs_pair, vis_pair = generate_pairwise_corrs_independent(
+                                data_pair,
+                                view_idx0=0,
+                                view_idx1=1,
+                                scale=8
+                            )
+                            
+                            N_pair = corrs_pair.shape[0]
+                            if N_pair < 10:
+                                continue
+                            
+                            max_points = 5000
+                            if N_pair > max_points:
+                                idx = torch.randperm(N_pair)[:max_points]
+                                corrs_pair = corrs_pair[idx]
+                                vis_pair = vis_pair[idx]
+                            
+                            corrs_pair = corrs_pair.to(self.dev)
+                            vis_pair = vis_pair.to(self.dev)
+                            
+                            coords_i = corrs_pair[:, 0, :].to(self.dev)
+                            coords_j = corrs_pair[:, 1, :].to(self.dev)
+                            
+                            feat_i = sample_map_at_coords(feats[vi_sample_idx], coords_i, H_orig, W_orig)
+                            feat_j = sample_map_at_coords(feats[vj_sample_idx], coords_j, H_orig, W_orig)
+                            
+                            hmap_i = sample_map_at_coords(hmap[vi_sample_idx], coords_i, H_orig, W_orig)
+                            hmap_j = sample_map_at_coords(hmap[vj_sample_idx], coords_j, H_orig, W_orig)
+                            
+                            mask_valid = vis_pair[:, 0] & vis_pair[:, 1]
+                            if mask_valid.sum() < 10:
+                                continue
+                            
+                            feat_i = feat_i[mask_valid]
+                            feat_j = feat_j[mask_valid]
+                            hmap_i = hmap_i[mask_valid]
+                            hmap_j = hmap_j[mask_valid]
+                            
+                            loss_desc_pair, conf_pair = dual_softmax_loss(feat_i, feat_j, temp=0.2)
+                            loss_desc_total += loss_desc_pair
+                            loss_hmap_pair = keypoint_loss(hmap_i, conf_pair) + keypoint_loss(hmap_j, conf_pair)
+                            loss_hmap_total += loss_hmap_pair
+                            valid_pairs += 1
                         
-                        if len(view_ids) < 2:
-                            continue
-                        
-                        # ===== 对该k-view子集中的所有view对独立生成对应点 =====
-                        for vi_local in range(len(view_ids)):
-                            for vj_local in range(vi_local + 1, len(view_ids)):
-                                vi_id = view_ids[vi_local]
-                                vj_id = view_ids[vj_local]
-                                
-                                # 从view ID映射到sample_data中的索引
-                                vi_sample_idx = id_to_idx[vi_id]
-                                vj_sample_idx = id_to_idx[vj_id]
-                                
-                                vi_global = vi_sample_idx
-                                vj_global = vj_sample_idx
-                                
-                                # 构造双view的数据（从原始sample_data中提取）
-                                try:
-                                    data_pair = {
-                                        'images': [sample_data['images'][vi_sample_idx], sample_data['images'][vj_sample_idx]],
-                                        'depths': [sample_data['depths'][vi_sample_idx], sample_data['depths'][vj_sample_idx]],
-                                        'Ks': [sample_data['Ks'][vi_sample_idx], sample_data['Ks'][vj_sample_idx]],
-                                        'T_0to': [torch.eye(3, 4, device=self.dev), 
-                                                 sample_data['T_0to'][vj_sample_idx] if 'T_0to' in sample_data else torch.eye(3, 4, device=self.dev)],
-                                        'scales': [sample_data['scales'][vi_sample_idx] if 'scales' in sample_data else torch.tensor([1.0, 1.0]),
-                                                  sample_data['scales'][vj_sample_idx] if 'scales' in sample_data else torch.tensor([1.0, 1.0])],
-                                    }
-                                    if 'image_masks' in sample_data:
-                                        data_pair['image_masks'] = [sample_data['image_masks'][vi_sample_idx], 
-                                                                   sample_data['image_masks'][vj_sample_idx]]
-                                except (KeyError, IndexError, TypeError) as e:
-                                    # 跳过无法构造的view对
-                                    continue
-                                
-                                # 独立生成这对view的对应点
-                                corrs_pair, vis_pair = generate_pairwise_corrs_independent(
-                                    data_pair, 
-                                    view_idx0=0, 
-                                    view_idx1=1, 
-                                    scale=8
-                                )
-                                
-                                N_pair = corrs_pair.shape[0]
-                                
-                                if N_pair < 10:
-                                    continue
-                                
-                                # 限制最大点数
-                                max_points = 5000
-                                if N_pair > max_points:
-                                    idx = torch.randperm(N_pair)[:max_points]
-                                    corrs_pair = corrs_pair[idx]
-                                    vis_pair = vis_pair[idx]
-                                
-                                corrs_pair = corrs_pair.to(self.dev)
-                                vis_pair = vis_pair.to(self.dev)
-                                
-                                # 采样该对的特征
-                                coords_i = corrs_pair[:, 0, :].to(self.dev)
-                                coords_j = corrs_pair[:, 1, :].to(self.dev)
-                                
-                                feat_i = sample_map_at_coords(feats[vi_global], coords_i, H_orig, W_orig)
-                                feat_j = sample_map_at_coords(feats[vj_global], coords_j, H_orig, W_orig)
-                                
-                                hmap_i = sample_map_at_coords(hmap[vi_global], coords_i, H_orig, W_orig)
-                                hmap_j = sample_map_at_coords(hmap[vj_global], coords_j, H_orig, W_orig)
-                                
-                                # 应用visibility mask
-                                mask_valid = vis_pair[:, 0] & vis_pair[:, 1]
-                                
-                                if mask_valid.sum() < 10:
-                                    continue
-                                
-                                feat_i = feat_i[mask_valid]
-                                feat_j = feat_j[mask_valid]
-                                hmap_i = hmap_i[mask_valid]
-                                hmap_j = hmap_j[mask_valid]
-                                
-                                # ===== 计算 pairwise dual-softmax loss =====
-                                loss_desc_pair, conf_pair = dual_softmax_loss(feat_i, feat_j, temp=0.2)
-                                loss_desc_total += loss_desc_pair
-                                
-                                # ===== 计算 reliability/keypoint loss =====
-                                loss_hmap_pair = keypoint_loss(hmap_i, conf_pair) + keypoint_loss(hmap_j, conf_pair)
-                                loss_hmap_total += loss_hmap_pair
-                                
-                                valid_pairs += 1
-                        
-                        # ===== kpts distillation loss（对该k-view子集的所有view） =====
-                        loss_kpts_b = torch.zeros([], device=self.dev)
-                        cnt = 0.0
-                        for view_id in view_ids:
-                            view_sample_idx = id_to_idx[view_id]
-                            pred_hm = kpts[view_sample_idx]  # [1, 65, H/8, W/8]
-                            img_v = sample_images[view_sample_idx]  # [3, H_orig, W_orig] or [1,...]
-                            loss_hm_v, acc_hm_v = alike_distill_loss(pred_hm[0], img_v)
-                            loss_kpts_b += loss_hm_v
-                            cnt += 1
-
-                        loss_kpts_total += loss_kpts_b / max(cnt, 1)
+                    loss_kpts_b = torch.zeros([], device=self.dev)
+                    cnt = 0.0
+                    for view_id in view_ids:
+                        view_sample_idx = id_to_idx[view_id]
+                        pred_hm = kpts[view_sample_idx]
+                        img_v = sample_images[view_sample_idx]
+                        loss_hm_v, acc_hm_v = alike_distill_loss(pred_hm[0], img_v)
+                        loss_kpts_b += loss_hm_v
+                        cnt += 1
+                    loss_kpts_total += loss_kpts_b / max(cnt, 1)
 
                 loss_desc = loss_desc_total / max(valid_pairs, 1)
                 loss_hmap = loss_hmap_total / max(valid_pairs, 1)
