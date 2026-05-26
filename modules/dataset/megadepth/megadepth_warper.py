@@ -70,9 +70,10 @@ def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1):
     valid_mask = nonzero_mask #* consistent_mask* covisible_mask 
 
     return valid_mask, w_kpts0
-def generate_exclusive_subsets(batch_data, subset_views_list=[5,4,3,2], scale=4):
+def generate_multiview_subsets_noexclude(batch_data, subset_views_list=[5,4,3,2], scale=4):
     """
-    生成递减互斥的多视图匹配子集。
+    生成全量非互斥的多视图匹配子集。
+    每个 k 级别都使用完整的对应点集合，不做cross-k互斥。
     
     Args:
         batch_data: dict, 包含 'images', 'depths', 'Ks', 'T_0to', 'T', 'scales', 'all_5view_ids'
@@ -82,8 +83,7 @@ def generate_exclusive_subsets(batch_data, subset_views_list=[5,4,3,2], scale=4)
     Returns:
         batch_points_dict: dict, k -> (subset_ids, (multi_corrs, vis))
     """
-    multi_corrs_5view, vis_5view = generate_multi_corrs_from_data(batch_data, scale=scale)
-
+    
     # ===== 处理 all_ids =====
     all_ids = batch_data['all_5view_ids']
     if isinstance(all_ids, torch.Tensor):
@@ -92,34 +92,53 @@ def generate_exclusive_subsets(batch_data, subset_views_list=[5,4,3,2], scale=4)
     id_to_idx = {vid: i for i, vid in enumerate(all_ids)}
 
     batch_points_dict = {}
-    used_points = set()  # 用于记录已经被使用的匹配点坐标 (anchor view)
-
+    
+    # 对每个 k 级别，生成其对应的 multi-view 对应点（可重复使用所有点）
     for k in subset_views_list:
         if k == 5:
-            # 保留全部 5-view 点
-            batch_points_dict[5] = (all_ids, (multi_corrs_5view, vis_5view))
-            # 添加 anchor 坐标到 used_points，舍入到1位小数避免精度问题
-            anchor_coords = multi_corrs_5view[:, 0].cpu().numpy()  # [N, 2]
-            used_points.update(tuple(np.round(coord, 1)) for coord in anchor_coords)
+            # k=5 时使用全部5-view数据
+            multi_corrs_k, vis_k = generate_multi_corrs_from_data(batch_data, scale=scale)
+            subset_ids = all_ids
         else:
-            # 生成互斥子集
-            subset_ids, (multi_corrs_k, vis_k) = select_subset_and_recompute_multi_corrs(
-                batch_data,
-                subset_views=k,
-                scale=scale,
-                used_points=used_points
-            )
-           # 如果返回为空，则给空数组
-            if multi_corrs_k is None or multi_corrs_k.shape[0] == 0:
-                subset_ids = []
-                multi_corrs_k = torch.empty((0, k, 2), dtype=torch.float32)
-                vis_k = torch.empty((0, k), dtype=torch.bool)
+            # k<5 时，从5-view数据中随机选择k个view并生成对应点
+            # 保证anchor view在内
+            anchor_id = all_ids[0]
+            remaining_ids = [v for v in all_ids if v != anchor_id]
+            
+            if k == 2 and len(all_ids) >= 2:
+                # 对于2-view，使用前两个（通常是最相似的一对）
+                subset_ids = all_ids[:2]
             else:
-                # 强制 subset_ids 全部为 Python int
-                subset_ids = [int(x) if not isinstance(x, int) else x for x in subset_ids]
-
-            batch_points_dict[k] = (subset_ids, (multi_corrs_k, vis_k))
-
+                # 随机选择 k-1 个其他view与anchor组成k-view
+                if len(remaining_ids) < k - 1:
+                    # 如果剩余view不足，用全部
+                    subset_ids = all_ids
+                else:
+                    subset_ids = [anchor_id] + list(np.random.choice(remaining_ids, k-1, replace=False))
+            
+            # 构造子集 data
+            subset_indices = [all_ids.index(v) for v in subset_ids]
+            data_subset = {}
+            for key in batch_data.keys():
+                if key in ['images', 'depths', 'Ks', 'T_0to', 'T', 'scales', 'image_masks']:
+                    if isinstance(batch_data[key], list):
+                        data_subset[key] = [batch_data[key][i] for i in subset_indices]
+                    else:
+                        data_subset[key] = batch_data[key]
+                else:
+                    data_subset[key] = batch_data[key]
+            data_subset['all_5view_ids'] = subset_ids
+            
+            # 生成对应点
+            multi_corrs_k, vis_k = generate_multi_corrs_from_data(data_subset, scale=scale)
+        
+        # 保存到 batch_points_dict
+        if multi_corrs_k is None or multi_corrs_k.shape[0] == 0:
+            multi_corrs_k = torch.empty((0, k, 2), dtype=torch.float32)
+            vis_k = torch.empty((0, k), dtype=torch.bool)
+        
+        batch_points_dict[k] = (subset_ids, (multi_corrs_k, vis_k))
+    
     return batch_points_dict, id_to_idx
 
 # ================================

@@ -208,8 +208,8 @@ class Trainer():
                     sample_images = sample_data['images']
                     H_orig, W_orig = sample_images[0].shape[1:]
                     
-                    # ===== 生成互斥子集 =====
-                    batch_points_dict, id_to_idx = generate_exclusive_subsets(sample_data)
+                    # ===== 生成非互斥多视图子集（全量pair reuse） =====
+                    batch_points_dict, id_to_idx = generate_multiview_subsets_noexclude(sample_data)
                     
                     # ====== forward 每个view =====
                     V = len(sample_images)
