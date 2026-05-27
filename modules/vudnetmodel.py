@@ -155,7 +155,8 @@ class VUDNetModel(nn.Module):
         self.variance_head = nn.Sequential(
             BasicLayer(64, 64, 3, padding=1),
             BasicLayer(64, 32, 3, padding=1),
-            nn.Conv2d(32, 1, 1)
+            nn.Conv2d(32, 1, 1), 
+            nn.Sigmoid()
         )
 
     def _unfold2d(self, x, ws=8):

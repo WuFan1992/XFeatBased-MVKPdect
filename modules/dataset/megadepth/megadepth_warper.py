@@ -141,6 +141,56 @@ def generate_multiview_subsets_noexclude(batch_data, subset_views_list=[5,4,3,2]
     
     return batch_points_dict, id_to_idx
 
+def generate_exclusive_subsets(batch_data, subset_views_list=[5,4,3,2], scale=4):
+    """
+    生成递减互斥的多视图匹配子集。
+    
+    Args:
+        batch_data: dict, 包含 'images', 'depths', 'Ks', 'T_0to', 'T', 'scales', 'all_5view_ids'
+        subset_views_list: list[int], e.g., [5,4,3,2]
+        scale: int, 下采样比例
+    
+    Returns:
+        batch_points_dict: dict, k -> (subset_ids, (multi_corrs, vis))
+    """
+    multi_corrs_5view, vis_5view = generate_multi_corrs_from_data(batch_data, scale=scale)
+
+    # ===== 处理 all_ids =====
+    all_ids = batch_data['all_5view_ids']
+    if isinstance(all_ids, torch.Tensor):
+        all_ids = all_ids.cpu().numpy().flatten().tolist()
+    all_ids = [int(x) if not isinstance(x, int) else x for x in all_ids]
+    id_to_idx = {vid: i for i, vid in enumerate(all_ids)}
+
+    batch_points_dict = {}
+    used_points = set()  # 用于记录已经被使用的匹配点坐标 (anchor view)
+
+    for k in subset_views_list:
+        if k == 5:
+            # 保留全部 5-view 点
+            batch_points_dict[5] = (all_ids, (multi_corrs_5view, vis_5view))
+            # 添加 anchor 坐标到 used_points，舍入到1位小数避免精度问题
+            anchor_coords = multi_corrs_5view[:, 0].cpu().numpy()  # [N, 2]
+            used_points.update(tuple(np.round(coord, 1)) for coord in anchor_coords)
+        else:
+            # 生成互斥子集
+            subset_ids, (multi_corrs_k, vis_k) = select_subset_and_recompute_multi_corrs(
+                batch_data,
+                subset_views=k,
+                scale=scale,
+                used_points=used_points
+            )
+           # 如果返回为空，则给空数组
+            if multi_corrs_k is None or multi_corrs_k.shape[0] == 0:
+                subset_ids, multi_corrs_k, vis_k = [], np.zeros((0, k, 2)), None
+            else:
+                # 强制 subset_ids 全部为 Python int
+                subset_ids = [int(x) if not isinstance(x, int) else x for x in subset_ids]
+
+            batch_points_dict[k] = (subset_ids, (multi_corrs_k, vis_k))
+
+    return batch_points_dict, id_to_idx
+
 # ================================
 # 1️⃣ 生成完整 5-view 对应点
 # ================================

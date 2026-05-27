@@ -41,29 +41,38 @@ def run_test(image_path, top_k=200, device="cuda"):
 
     rel_vis = reliability.squeeze().cpu().numpy()  # [H/8, W/8]
     rel_vis = cv2.resize(rel_vis, (W, H))
+    
+    var_vis = vars.squeeze().cpu().numpy()
+    var_vis = cv2.resize(var_vis, (W,H))
 
     print("heatmap range:", heatmap_vis.min(), heatmap_vis.max())
     print("reliability range:", rel_vis.min(), rel_vis.max())
+    print("variance range ", var_vis.min(), var_vis.max())
 
     # ===== 5. 显示 =====
-    plt.figure(figsize=(16, 5))
+    plt.figure(figsize=(20, 5))
 
-    plt.subplot(1, 3, 1)
+    plt.subplot(1, 4, 1)
     plt.title("Original")
     plt.imshow(img)
     plt.axis('off')
 
-    plt.subplot(1, 3, 2)
+    plt.subplot(1, 4, 2)
     plt.title("VUDNet Heatmap")
     plt.imshow(heatmap_vis, cmap='hot')
     plt.colorbar()
     plt.axis('off')
 
-    plt.subplot(1, 3, 3)
+    plt.subplot(1, 4, 3)
     plt.title("VUDNet Reliability")
     plt.imshow(rel_vis, cmap='jet')
     plt.colorbar()
     plt.axis('off')
+    
+    plt.subplot(1,4,4)
+    plt.title("Variance")
+    plt.imshow(var_vis, cmap='jet')
+    plt.colorbar()
 
     plt.tight_layout()
     plt.show()

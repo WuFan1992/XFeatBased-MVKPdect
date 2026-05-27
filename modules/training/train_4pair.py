@@ -173,7 +173,9 @@ class Trainer():
                 loss_desc_total = torch.zeros([], device=self.dev)
                 loss_hmap_total = torch.zeros([], device=self.dev)
                 loss_kpts_total = torch.zeros([], device=self.dev)
+                loss_var_total = torch.zeros([], device=self.dev)
                 valid_pairs = 0
+                valid_var_subsets = 0
 
                 for b in range(self.batch_size):
                     sample_data = self._get_sample_data(d, b)
@@ -262,11 +264,60 @@ class Trainer():
                         loss_kpts_b += loss_hm_v
                     loss_kpts_total += loss_kpts_b / 5.0
 
+                    # ===== Variance Loss from Multi-View Subsets =====
+                    batch_points_dict, id_to_idx = generate_exclusive_subsets(sample_data)
+                    subset_views_list = [5, 4, 3, 2]
+                    
+                    for k in subset_views_list:
+                        if k not in batch_points_dict:
+                            continue
+                        
+                        subset_ids, (corrs_k, vis_k) = batch_points_dict[k]
+                        N_points = corrs_k.shape[0] if corrs_k is not None else 0
+                        
+                        if N_points < 20:
+                            continue
+                        
+                        # Limit maximum points
+                        max_points = 5000
+                        if N_points > max_points:
+                            idx = torch.randperm(N_points)[:max_points]
+                            corrs_k = corrs_k[idx]
+                            vis_k = vis_k[idx]
+                        
+                        corrs_k = corrs_k.to(self.dev)
+                        vis_k = vis_k.to(self.dev)
+                        
+                        # Sample features and variance from k views
+                        f_inv_per_point, sigma_per_point = [], []
+                        
+                        for v_local in range(k):
+                            view_id = subset_ids[v_local]
+                            view_idx = id_to_idx[view_id]
+                            coords = corrs_k[:, v_local, :].to(self.dev)
+                            
+                            f_inv_sample = sample_map_at_coords(feats[view_idx], coords, H_orig, W_orig)
+                            sigma_sample = sample_map_at_coords(vars[view_idx], coords, H_orig, W_orig)
+                            
+                            f_inv_per_point.append(f_inv_sample)
+                            sigma_per_point.append(sigma_sample)
+                        
+                        f_inv_k = torch.stack(f_inv_per_point, dim=1)  # [N, k, C]
+                        sigma_k = torch.stack(sigma_per_point, dim=1)  # [N, k, 1]
+                        
+                        visibility = vis_k.bool() if vis_k is not None else torch.ones((N_points, k), dtype=torch.bool, device=self.dev)
+                        
+                        # Compute sigma loss
+                        loss_var_k, var_target = sigma_loss_from_pcorrect(f_inv_k, sigma_k, visibility)
+                        loss_var_total += loss_var_k
+                        valid_var_subsets += 1
+
                 loss_desc = loss_desc_total / max(valid_pairs, 1)
                 loss_hmap = loss_hmap_total / max(valid_pairs, 1)
                 loss_kpts = loss_kpts_total / max(1, self.batch_size)
+                loss_var = loss_var_total / max(valid_var_subsets, 1)
 
-                loss = loss_desc + 1.0 * loss_hmap + 1.0 * loss_kpts
+                loss = loss_desc + 1.0 * loss_hmap + 1.0 * loss_kpts + 1.0 * loss_var
 
                 if valid_pairs == 0:
                     print(f"[WARN] Iter {i}: no valid pairs")
@@ -286,15 +337,17 @@ class Trainer():
                     print('saving iter ', i+1)
                     torch.save(self.net.state_dict(), self.ckpt_save_path + f'/{self.model_name}_{i+1}.pth')
 
-                pbar.set_description('Loss: {:.4f}  loss_c: {:.3f}  loss_hm: {:.3f}  loss_kp: {:.3f}  pairs: {} '.format(
-                                      loss.item(), loss_desc, loss_hmap, loss_kpts, valid_pairs))
+                pbar.set_description('Loss: {:.4f}  loss_c: {:.3f}  loss_hm: {:.3f}  loss_kp: {:.3f}  loss_var: {:.3f}  pairs: {}  var_subsets: {} '.format(
+                                      loss.item(), loss_desc, loss_hmap, loss_kpts, loss_var, valid_pairs, valid_var_subsets))
                 pbar.update(1)
 
                 self.writer.add_scalar('Loss/total', loss.item(), i)
                 self.writer.add_scalar('Loss/coarse', loss_desc, i)
                 self.writer.add_scalar('Loss/reliability', loss_hmap, i)
                 self.writer.add_scalar('Loss/keypoint_pos', loss_kpts, i)
+                self.writer.add_scalar('Loss/variance', loss_var, i)
                 self.writer.add_scalar('Metric/valid_pairs', valid_pairs, i)
+                self.writer.add_scalar('Metric/valid_var_subsets', valid_var_subsets, i)
 
 
 if __name__ == '__main__':
