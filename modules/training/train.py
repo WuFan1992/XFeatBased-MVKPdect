@@ -224,76 +224,78 @@ class Trainer():
                         hmap.append(hmap_v)
                         vars.append(var_v)
                         
-                    # ===== 只使用 k=5 的5-view点，按10对独立生成对应点 =====
+                    # ===== 只使用 k=5 的5-view点，view1作为基准与其余4个view配对 =====
                     view_ids, _ = batch_points_dict[5]
                     if len(view_ids) < 5:
                         continue
                     
-                    for vi_local in range(len(view_ids)):
-                        for vj_local in range(vi_local + 1, len(view_ids)):
-                            vi_sample_idx = id_to_idx[view_ids[vi_local]]
-                            vj_sample_idx = id_to_idx[view_ids[vj_local]]
-                            
-                            try:
-                                data_pair = {
-                                    'images': [sample_data['images'][vi_sample_idx], sample_data['images'][vj_sample_idx]],
-                                    'depths': [sample_data['depths'][vi_sample_idx], sample_data['depths'][vj_sample_idx]],
-                                    'Ks': [sample_data['Ks'][vi_sample_idx], sample_data['Ks'][vj_sample_idx]],
-                                    'T_0to': [torch.eye(3, 4, device=self.dev), 
-                                             sample_data['T_0to'][vj_sample_idx] if 'T_0to' in sample_data else torch.eye(3, 4, device=self.dev)],
-                                    'scales': [sample_data['scales'][vi_sample_idx] if 'scales' in sample_data else torch.tensor([1.0, 1.0]),
-                                              sample_data['scales'][vj_sample_idx] if 'scales' in sample_data else torch.tensor([1.0, 1.0])],
-                                }
-                                if 'image_masks' in sample_data:
-                                    data_pair['image_masks'] = [sample_data['image_masks'][vi_sample_idx], 
-                                                               sample_data['image_masks'][vj_sample_idx]]
-                            except (KeyError, IndexError, TypeError):
-                                continue
-                            
-                            corrs_pair, vis_pair = generate_pairwise_corrs_independent(
-                                data_pair,
-                                view_idx0=0,
-                                view_idx1=1,
-                                scale=8
-                            )
-                            
-                            N_pair = corrs_pair.shape[0]
-                            if N_pair < 10:
-                                continue
-                            
-                            max_points = 5000
-                            if N_pair > max_points:
-                                idx = torch.randperm(N_pair)[:max_points]
-                                corrs_pair = corrs_pair[idx]
-                                vis_pair = vis_pair[idx]
-                            
-                            corrs_pair = corrs_pair.to(self.dev)
-                            vis_pair = vis_pair.to(self.dev)
-                            
-                            coords_i = corrs_pair[:, 0, :].to(self.dev)
-                            coords_j = corrs_pair[:, 1, :].to(self.dev)
-                            
-                            feat_i = sample_map_at_coords(feats[vi_sample_idx], coords_i, H_orig, W_orig)
-                            feat_j = sample_map_at_coords(feats[vj_sample_idx], coords_j, H_orig, W_orig)
-                            
-                            hmap_i = sample_map_at_coords(hmap[vi_sample_idx], coords_i, H_orig, W_orig)
-                            hmap_j = sample_map_at_coords(hmap[vj_sample_idx], coords_j, H_orig, W_orig)
-                            
-                            mask_valid = vis_pair[:, 0] & vis_pair[:, 1]
-                            if mask_valid.sum() < 10:
-                                continue
-                            
-                            feat_i = feat_i[mask_valid]
-                            feat_j = feat_j[mask_valid]
-                            hmap_i = hmap_i[mask_valid]
-                            hmap_j = hmap_j[mask_valid]
-                            
-                            loss_desc_pair, conf_pair = dual_softmax_loss(feat_i, feat_j, temp=0.2)
-                            loss_desc_total += loss_desc_pair
-                            loss_hmap_pair = keypoint_loss(hmap_i, conf_pair) + keypoint_loss(hmap_j, conf_pair)
-                            loss_hmap_total += loss_hmap_pair
-                            valid_pairs += 1
+                    anchor_id = view_ids[0]
+                    anchor_idx = id_to_idx[anchor_id]
+                    
+                    for vj_local in range(1, len(view_ids)):
+                        vj_id = view_ids[vj_local]
+                        vj_idx = id_to_idx[vj_id]
                         
+                        try:
+                            data_pair = {
+                                'images': [sample_data['images'][anchor_idx], sample_data['images'][vj_idx]],
+                                'depths': [sample_data['depths'][anchor_idx], sample_data['depths'][vj_idx]],
+                                'Ks': [sample_data['Ks'][anchor_idx], sample_data['Ks'][vj_idx]],
+                                'T_0to': [torch.eye(3, 4, device=self.dev), 
+                                         sample_data['T_0to'][vj_idx] if 'T_0to' in sample_data else torch.eye(3, 4, device=self.dev)],
+                                'scales': [sample_data['scales'][anchor_idx] if 'scales' in sample_data else torch.tensor([1.0, 1.0]),
+                                          sample_data['scales'][vj_idx] if 'scales' in sample_data else torch.tensor([1.0, 1.0])],
+                            }
+                            if 'image_masks' in sample_data:
+                                data_pair['image_masks'] = [sample_data['image_masks'][anchor_idx], 
+                                                           sample_data['image_masks'][vj_idx]]
+                        except (KeyError, IndexError, TypeError):
+                            continue
+                        
+                        corrs_pair, vis_pair = generate_pairwise_corrs_independent(
+                            data_pair,
+                            view_idx0=0,
+                            view_idx1=1,
+                            scale=8
+                        )
+                        
+                        N_pair = corrs_pair.shape[0]
+                        if N_pair < 10:
+                            continue
+                        
+                        max_points = 5000
+                        if N_pair > max_points:
+                            idx = torch.randperm(N_pair)[:max_points]
+                            corrs_pair = corrs_pair[idx]
+                            vis_pair = vis_pair[idx]
+                        
+                        corrs_pair = corrs_pair.to(self.dev)
+                        vis_pair = vis_pair.to(self.dev)
+                        
+                        coords_i = corrs_pair[:, 0, :].to(self.dev)
+                        coords_j = corrs_pair[:, 1, :].to(self.dev)
+                        
+                        feat_i = sample_map_at_coords(feats[anchor_idx], coords_i, H_orig, W_orig)
+                        feat_j = sample_map_at_coords(feats[vj_idx], coords_j, H_orig, W_orig)
+                        
+                        hmap_i = sample_map_at_coords(hmap[anchor_idx], coords_i, H_orig, W_orig)
+                        hmap_j = sample_map_at_coords(hmap[vj_idx], coords_j, H_orig, W_orig)
+                        
+                        mask_valid = vis_pair[:, 0] & vis_pair[:, 1]
+                        if mask_valid.sum() < 10:
+                            continue
+                        
+                        feat_i = feat_i[mask_valid]
+                        feat_j = feat_j[mask_valid]
+                        hmap_i = hmap_i[mask_valid]
+                        hmap_j = hmap_j[mask_valid]
+                        
+                        loss_desc_pair, conf_pair = dual_softmax_loss(feat_i, feat_j, temp=0.2)
+                        loss_desc_total += loss_desc_pair
+                        loss_hmap_pair = keypoint_loss(hmap_i, conf_pair) + keypoint_loss(hmap_j, conf_pair)
+                        loss_hmap_total += loss_hmap_pair
+                        valid_pairs += 1
+                    
                     loss_kpts_b = torch.zeros([], device=self.dev)
                     cnt = 0.0
                     for view_id in view_ids:
