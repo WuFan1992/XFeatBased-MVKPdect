@@ -156,7 +156,6 @@ class VUDNetModel(nn.Module):
             BasicLayer(64, 64, 3, padding=1),
             BasicLayer(64, 32, 3, padding=1),
             nn.Conv2d(32, 1, 1), 
-            nn.Sigmoid()
         )
 
     def _unfold2d(self, x, ws=8):
@@ -254,7 +253,9 @@ class VUDNetModel(nn.Module):
 
         heatmap = self.heatmap_head(feats)
         
-        variance = self.variance_head(feats)
+        #variance = self.variance_head(feats)
+        raw_variance = self.variance_head(feats)
+        variance = F.softplus(raw_variance)
 
         x_gray = x.mean(dim=1, keepdim=True)
         keypoints = self.keypoint_head(self._unfold2d(x_gray, ws=8))

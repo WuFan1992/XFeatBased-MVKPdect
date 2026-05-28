@@ -331,7 +331,7 @@ class Trainer():
                         visibility = vis_k.bool() if vis_k is not None else torch.ones((N_points, k), dtype=torch.bool, device=self.dev)
                         
                         # Compute sigma loss
-                        loss_var_k, var_target = sigma_loss_from_pcorrect(f_inv_k, sigma_k, visibility)
+                        loss_var_k, var_target = sigma_consistency_loss(f_inv_k, sigma_k, visibility)
                         loss_var_total += loss_var_k
                         valid_var_subsets += 1
 

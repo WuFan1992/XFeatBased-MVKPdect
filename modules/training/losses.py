@@ -140,54 +140,82 @@ def keypoint_loss(heatmap, target):
     L1_loss = F.l1_loss(heatmap, target)
     return L1_loss * 3.0
 
-def compute_p_correct(f_inv, visibility, tau=0.1, eps=1e-6):
+def compute_descriptor_consistency_target(
+    f_inv,
+    visibility,
+    eps=1e-6,
+):
     """
-    f_inv: [N, V, C]
-    visibility: [N, V]
-    returns: [N, V] p_correct
+    Multi-view descriptor consistency target.
+
+    Args:
+        f_inv: [N, V, C]
+        visibility: [N, V] bool
+
+    Returns:
+        var_target: [N]
     """
-    N, V, C = f_inv.shape
-    f = F.normalize(f_inv, dim=2)  # [N,V,C]
 
-    p_all = torch.zeros(N, V, device=f.device)
-    count = torch.zeros(N, V, device=f.device)
+    # ===== normalize descriptor =====
+    f = F.normalize(f_inv, dim=-1)
 
-    for i in range(V):
-        for j in range(i + 1, V):
-            mask = visibility[:, i] & visibility[:, j]  # [N]
-            idx = mask.nonzero(as_tuple=False).squeeze(-1)
-            if idx.numel() < 10:
-                continue
+    vis = visibility.float().unsqueeze(-1)  # [N,V,1]
 
-            fi = f[idx, i]  # [M, C]
-            fj = f[idx, j]  # [M, C]
+    # ===== masked mean =====
+    denom = vis.sum(dim=1, keepdim=True).clamp(min=1.0)
 
-            # [M, M] 相似度矩阵
-            sim = fi @ fj.t() / tau
-            prob = F.softmax(sim, dim=1)
-            p = torch.diagonal(prob)  # [M], 正确匹配概率
+    mean_f = (f * vis).sum(dim=1, keepdim=True) / denom
 
-            # 累加
-            p_all[idx, i] += p
-            p_all[idx, j] += p
-            count[idx, i] += 1
-            count[idx, j] += 1
+    # ===== squared deviation =====
+    sq_dev = ((f - mean_f) ** 2).sum(dim=-1)  # [N,V]
 
-    p_all = p_all / (count + eps)
-    return p_all.clamp(eps, 1.0)
+    # ===== mask invisible views =====
+    sq_dev = sq_dev * visibility.float()
 
-def sigma_loss_from_pcorrect(f_inv, sigma_pred, visibility):
+    # ===== average variance =====
+    var_target = sq_dev.sum(dim=1) / (
+        visibility.float().sum(dim=1).clamp(min=1.0)
+    )
 
-    p_correct = compute_p_correct(f_inv, visibility)  # [N,V]
+    return var_target.detach()
 
-    var_target = (1.0 - p_correct).detach()
+def sigma_consistency_loss(
+    f_inv,
+    sigma_pred,
+    visibility,
+):
+    """
+    Supervise sigma using multi-view descriptor consistency.
+    
+    Args:
+        f_inv: [N,V,C]
+        sigma_pred: [N,V,1]
+        visibility: [N,V]
+    """
 
-    sigma_pred = sigma_pred.squeeze(-1)
+    # ===== target =====
+    var_target = compute_descriptor_consistency_target(
+        f_inv,
+        visibility,
+    )  # [N]
 
-    loss = F.mse_loss(sigma_pred, var_target)
+    # ===== prediction =====
+    sigma_pred = sigma_pred.squeeze(-1)  # [N,V]
+
+    # ===== average predicted sigma =====
+    sigma_mean = (
+        sigma_pred * visibility.float()
+    ).sum(dim=1) / (
+        visibility.float().sum(dim=1).clamp(min=1.0)
+    )
+
+    # ===== robust regression =====
+    loss = F.smooth_l1_loss(
+        sigma_mean,
+        var_target,
+    )
 
     return loss, var_target
-
 
 
 def multi_view_xfeat_heatmap_loss(
