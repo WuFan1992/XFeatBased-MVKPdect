@@ -176,6 +176,22 @@ def compute_descriptor_consistency_target(
     var_target = sq_dev.sum(dim=1) / (
         visibility.float().sum(dim=1).clamp(min=1.0)
     )
+    
+    # robust normalization
+    p95 = torch.quantile(
+    var_target.detach(),
+    0.95
+    )
+
+    var_target = var_target / (p95 + 1e-6)
+
+    # VERY IMPORTANT
+    var_target = torch.clamp(
+        var_target,
+        0.0,
+        1.0
+    )
+   
 
     return var_target.detach()
 
