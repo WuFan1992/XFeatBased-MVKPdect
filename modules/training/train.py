@@ -163,6 +163,119 @@ class Trainer():
                     sample_data[key] = value
         return sample_data
 
+    def _sample_hard_negatives_from_multiview(self, feat_i, feat_j, feats, sample_images, 
+                                               sample_data, H_orig, W_orig, coords_i, coords_j,
+                                               num_neg_per_point=4, num_candidates=16, radius=24):
+        """
+        Sample geometry-aware hard negatives from other views.
+
+        We project matched points from view 0 into additional views and mine negatives
+        from a local neighbourhood around those projected locations. This is much harder
+        than uniformly sampling random points across the image.
+
+        Args:
+            feat_i, feat_j: [M, C] matched features from view 0 and 1
+            feats: list of feature maps for all views
+            sample_images: list of images for all views
+            sample_data: metadata for all views
+            H_orig, W_orig: original image dimensions
+            coords_i, coords_j: [M, 2] matched pixel coordinates in views 0 and 1
+            num_neg_per_point: number of hard negatives to return per matched point
+            num_candidates: number of candidate negatives to mine per point
+            radius: spatial radius (pixels) around the projected location to search
+
+        Returns:
+            hard_neg_feat_i: [M, K, C] hard negative features for view 0
+            hard_neg_feat_j: [M, K, C] hard negative features for view 1
+        """
+        M = feat_i.shape[0]
+        C = feat_i.shape[1]
+        V = len(feats)
+
+        if V < 3 or M == 0:
+            return None, None
+
+        hard_neg_feat_i_list = []
+        hard_neg_feat_j_list = []
+
+        # Use views 2, 3, 4 as sources for hard negatives
+        neg_views = list(range(2, min(V, 5)))
+        if len(neg_views) == 0:
+            return None, None
+
+        # Pre-flatten coords_i for later candidate generation
+        coords_i = coords_i.detach()
+
+        for neg_view_idx in neg_views:
+            neg_feat = feats[neg_view_idx]  # [1, C, H, W]
+
+            # Project view-0 matched points into the candidate view
+            try:
+                depth0 = sample_data['depths'][0]
+                depth_v = sample_data['depths'][neg_view_idx]
+                K0 = sample_data['Ks'][0]
+                Kv = sample_data['Ks'][neg_view_idx]
+                T_0to_v = sample_data['T_0to'][neg_view_idx]
+
+                coords0_b = coords_i.unsqueeze(0)
+                depth0_b = depth0.unsqueeze(0) if depth0.dim() == 2 else depth0
+                depth_v_b = depth_v.unsqueeze(0) if depth_v.dim() == 2 else depth_v
+                valid_mask, proj_coords = warp_kpts(
+                    coords0_b,
+                    depth0_b,
+                    depth_v_b,
+                    T_0to_v.unsqueeze(0),
+                    K0.unsqueeze(0),
+                    Kv.unsqueeze(0)
+                )
+                valid_mask = valid_mask[0]
+                proj_coords = proj_coords[0]
+                proj_coords[:, 0].clamp_(0, W_orig - 1)
+                proj_coords[:, 1].clamp_(0, H_orig - 1)
+            except Exception:
+                proj_coords = coords_i
+                valid_mask = torch.ones((M,), dtype=torch.bool, device=self.dev)
+
+            if valid_mask.sum() == 0:
+                continue
+
+            # Local randomized candidates around the projected location
+            offsets = (torch.rand((M, num_candidates, 2), device=self.dev) * 2 - 1) * radius
+            min_dist = 4.0
+            if num_candidates > 1:
+                too_close = offsets.abs() < min_dist
+                offsets = offsets + torch.sign(offsets) * min_dist * too_close.float()
+            cand_coords = proj_coords.unsqueeze(1) + offsets
+            cand_coords[..., 0].clamp_(0, W_orig - 1)
+            cand_coords[..., 1].clamp_(0, H_orig - 1)
+            cand_coords = cand_coords.view(-1, 2)
+
+            cand_feats = sample_map_at_coords(neg_feat, cand_coords, H_orig, W_orig)
+            if cand_feats.numel() == 0:
+                continue
+
+            cand_feats = cand_feats.view(M, -1, C)
+            k = min(num_neg_per_point, cand_feats.shape[1])
+
+            sim_i = torch.einsum('mc,mkc->mk', feat_i, cand_feats)
+            sim_j = torch.einsum('mc,mkc->mk', feat_j, cand_feats)
+
+            _, idx_i = sim_i.topk(k, dim=1, largest=True, sorted=False)
+            _, idx_j = sim_j.topk(k, dim=1, largest=True, sorted=False)
+            idx_i = idx_i.unsqueeze(-1).expand(-1, -1, C)
+            idx_j = idx_j.unsqueeze(-1).expand(-1, -1, C)
+
+            hard_neg_feat_i_list.append(torch.gather(cand_feats, 1, idx_i))
+            hard_neg_feat_j_list.append(torch.gather(cand_feats, 1, idx_j))
+
+        if len(hard_neg_feat_i_list) == 0:
+            return None, None
+
+        hard_neg_feat_i = torch.cat(hard_neg_feat_i_list, dim=1)
+        hard_neg_feat_j = torch.cat(hard_neg_feat_j_list, dim=1)
+
+        return hard_neg_feat_i, hard_neg_feat_j
+
 
     def train(self):
 
@@ -273,7 +386,28 @@ class Trainer():
                     hmap_i = hmap_i[mask_valid]
                     hmap_j = hmap_j[mask_valid]
 
-                    loss_desc_pair, conf_pair = dual_softmax_loss(feat_i, feat_j, temp=0.2)
+                    # ===== Extract hard negatives from multi-view subsets =====
+                    hard_neg_feat_i = None
+                    hard_neg_feat_j = None
+                    
+                    if V >= 3:  # Only if we have 3+ views
+                        hard_neg_feat_i, hard_neg_feat_j = self._sample_hard_negatives_from_multiview(
+                            feat_i, feat_j, feats, sample_images,
+                            sample_data, H_orig, W_orig,
+                            coords_i, coords_j,
+                            num_neg_per_point=4,
+                            num_candidates=16,
+                            radius=24
+                        )
+                    
+                    loss_desc_pair, conf_pair = dual_softmax_loss(
+                        feat_i, feat_j, 
+                        temp=0.2,
+                        hard_neg_X=hard_neg_feat_i,
+                        hard_neg_Y=hard_neg_feat_j,
+                        hard_neg_weight=0.3,
+                        margin=0.1
+                    )
                     loss_desc_total += loss_desc_pair
                     loss_hmap_pair = keypoint_loss(hmap_i, conf_pair) + keypoint_loss(hmap_j, conf_pair)
                     loss_hmap_total += loss_hmap_pair
