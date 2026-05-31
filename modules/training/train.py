@@ -163,6 +163,78 @@ class Trainer():
                     sample_data[key] = value
         return sample_data
 
+    def _sample_hard_negatives_from_multiview(self, feat_i, feat_j, feats, sample_images, 
+                                               sample_data, H_orig, W_orig, num_neg_per_point=4):
+        """
+        Sample hard negatives from other views of the same 3D points.
+        Strategy: Randomly sample points from feature maps of additional views (view 2+).
+        These act as hard negatives because they're real image points but from different views.
+        
+        Args:
+            feat_i, feat_j: [M, C] matched features from view 0 and 1
+            feats: list of feature maps for all views
+            sample_images: list of images for all views
+            sample_data: metadata for all views
+            H_orig, W_orig: original image dimensions
+            num_neg_per_point: number of hard negatives to sample per matched point
+        
+        Returns:
+            hard_neg_feat_i: [M, K, C] hard negative features for view 0
+            hard_neg_feat_j: [M, K, C] hard negative features for view 1
+        """
+        M = feat_i.shape[0]
+        C = feat_i.shape[1]
+        V = len(feats)
+        
+        # If we don't have enough views, return None
+        if V < 3:
+            return None, None
+        
+        # Use views 2, 3, 4 as sources for hard negatives
+        hard_neg_views = list(range(2, min(V, 5)))
+        
+        if len(hard_neg_views) == 0:
+            return None, None
+        
+        hard_neg_feat_i_list = []
+        hard_neg_feat_j_list = []
+        
+        try:
+            # For each negatives source view, sample random points
+            num_neg_per_view = max(1, num_neg_per_point // len(hard_neg_views))
+            
+            for _ in range(num_neg_per_view):
+                # Randomly select a source view for this batch of hard negatives
+                neg_view_idx = hard_neg_views[torch.randint(0, len(hard_neg_views), (1,)).item()]
+                neg_feat = feats[neg_view_idx]  # [1, C, H, W]
+                
+                C_neg, H_neg, W_neg = neg_feat.shape[1], neg_feat.shape[2], neg_feat.shape[3]
+                
+                # Sample random coordinates in the original image space [0, H_orig] x [0, W_orig]
+                x_coords_rand = torch.rand(M, device=self.dev) * (W_orig - 1)
+                y_coords_rand = torch.rand(M, device=self.dev) * (H_orig - 1)
+                coords_neg_orig = torch.stack([x_coords_rand, y_coords_rand], dim=1)  # [M, 2]
+                
+                # Sample features at these coordinates (sample_map_at_coords handles out-of-bounds)
+                feat_neg = sample_map_at_coords(neg_feat, coords_neg_orig, H_orig, W_orig)  # [M, C]
+                
+                # Same hard negative is used for both views (they're random points, not specific to view)
+                hard_neg_feat_i_list.append(feat_neg.unsqueeze(1))  # [M, 1, C]
+                hard_neg_feat_j_list.append(feat_neg.unsqueeze(1))  # [M, 1, C]
+            
+            if len(hard_neg_feat_i_list) == 0:
+                return None, None
+            
+            # Concatenate all hard negatives: [M, K, C]
+            hard_neg_feat_i = torch.cat(hard_neg_feat_i_list, dim=1)
+            hard_neg_feat_j = torch.cat(hard_neg_feat_j_list, dim=1)
+            
+            return hard_neg_feat_i, hard_neg_feat_j
+        
+        except Exception as e:
+            # Graceful degradation: if anything goes wrong, train without hard negatives
+            return None, None
+
 
     def train(self):
 
@@ -273,7 +345,25 @@ class Trainer():
                     hmap_i = hmap_i[mask_valid]
                     hmap_j = hmap_j[mask_valid]
 
-                    loss_desc_pair, conf_pair = dual_softmax_loss(feat_i, feat_j, temp=0.2)
+                    # ===== Extract hard negatives from multi-view subsets =====
+                    hard_neg_feat_i = None
+                    hard_neg_feat_j = None
+                    
+                    if V >= 3:  # Only if we have 3+ views
+                        hard_neg_feat_i, hard_neg_feat_j = self._sample_hard_negatives_from_multiview(
+                            feat_i, feat_j, feats, sample_images, 
+                            sample_data, H_orig, W_orig, 
+                            num_neg_per_point=4
+                        )
+                    
+                    loss_desc_pair, conf_pair = dual_softmax_loss(
+                        feat_i, feat_j, 
+                        temp=0.2,
+                        hard_neg_X=hard_neg_feat_i,
+                        hard_neg_Y=hard_neg_feat_j,
+                        hard_neg_weight=0.3,
+                        margin=0.1
+                    )
                     loss_desc_total += loss_desc_pair
                     loss_hmap_pair = keypoint_loss(hmap_i, conf_pair) + keypoint_loss(hmap_j, conf_pair)
                     loss_hmap_total += loss_hmap_pair

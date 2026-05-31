@@ -73,23 +73,64 @@ def mv_infonce_masked(f_inv, visibility, tau=0.2):
     return loss / count
 
 
-def dual_softmax_loss(X, Y, temp = 0.2):
+def dual_softmax_loss(X, Y, temp = 0.2, hard_neg_X=None, hard_neg_Y=None, hard_neg_weight=0.3, margin=0.1):
+    """
+    Dual softmax loss with optional hard negative mining from multi-view data.
+    
+    Args:
+        X, Y: [M, C] matched feature descriptors from two views
+        temp: temperature for softmax
+        hard_neg_X: [M, K, C] hard negative features for view X (from other views of same 3D point)
+        hard_neg_Y: [M, K, C] hard negative features for view Y
+        hard_neg_weight: weight for hard negative loss component
+        margin: margin for triplet loss
+    
+    Returns:
+        loss: scalar loss value
+        conf: [M] confidence scores
+    """
     if X.size() != Y.size() or X.dim() != 2 or Y.dim() != 2:
         raise RuntimeError('Error: X and Y shapes must match and be 2D matrices')
 
+    # ===== Standard pair-wise loss =====
     dist_mat = (X @ Y.t()) * temp
     conf_matrix12 = F.log_softmax(dist_mat, dim=1)
     conf_matrix21 = F.log_softmax(dist_mat.t(), dim=1)
+
+    target = torch.arange(len(X), device = X.device)
+
+    pair_loss = F.nll_loss(conf_matrix12, target) + \
+                F.nll_loss(conf_matrix21, target)
+
+    # ===== Hard negative loss (multi-view) =====
+    hard_loss = torch.tensor(0.0, device=X.device, requires_grad=True)
+    
+    if hard_neg_X is not None and hard_neg_Y is not None:
+        # hard_neg_X: [M, K, C] - K hard negatives for each matched point
+        M, K, C = hard_neg_X.shape
+        
+        # Positive similarity (diagonal of dist_mat)
+        pos_sim = (X * Y).sum(dim=1)  # [M]
+        
+        # Hard negative similarity
+        # Compute X @ hard_neg_X^T using einsum: [M, K]
+        hard_sim_X = torch.einsum('mc,mkc->mk', X, hard_neg_X)
+        hard_sim_Y = torch.einsum('mc,mkc->mk', Y, hard_neg_Y)
+        
+        # Triplet margin loss: max(0, hard_sim - pos_sim + margin)
+        # We want: pos_sim > hard_sim (by at least margin)
+        triplet_loss_X = F.relu(hard_sim_X - pos_sim.unsqueeze(1) + margin).mean()
+        triplet_loss_Y = F.relu(hard_sim_Y - pos_sim.unsqueeze(1) + margin).mean()
+        
+        hard_loss = (triplet_loss_X + triplet_loss_Y) / 2.0
+
+    # ===== Total loss =====
+    loss = pair_loss + hard_neg_weight * hard_loss
 
     with torch.no_grad():
         conf12 = torch.exp( conf_matrix12 ).max(dim=-1)[0]
         conf21 = torch.exp( conf_matrix21 ).max(dim=-1)[0]
         conf = conf12 * conf21
-
-    target = torch.arange(len(X), device = X.device)
-
-    loss = F.nll_loss(conf_matrix12, target) + \
-           F.nll_loss(conf_matrix21, target)
 
     return loss, conf
 
