@@ -127,6 +127,10 @@ class MegaDepthPoseMNNBenchmark:
         with torch.no_grad():
             data_root = self.data_root
             tot_e_t, tot_e_R, tot_e_pose = [], [], []
+            all_sigma = [] 
+            all_epi_errs = []
+            
+            
             thresholds = [5, 10, 20]
             for scene_ind in range(len(self.scenes)):
                 import os
@@ -153,7 +157,8 @@ class MegaDepthPoseMNNBenchmark:
                                         
 
 
-                    kpts0, kpts1, _, _ = model_helper.match(im_A_path, im_B_path)
+                    kpts0, kpts1, sigma0, sigma1 = model_helper.match(im_A_path, im_B_path)
+
 
 
                     im_A = Image.open(im_A_path)
@@ -180,6 +185,7 @@ class MegaDepthPoseMNNBenchmark:
                             K1,
                             norm_threshold,
                             conf=0.99999,
+                            sigma0=sigma0, sigma1=sigma1
                         )
                     if ret is not None:
                         R_est, t_est, mask = ret
@@ -188,6 +194,14 @@ class MegaDepthPoseMNNBenchmark:
                         e_t, e_R = compute_pose_error(T0_to_1_est, R, t)
                         
                         epi_errs = compute_symmetrical_epipolar_errors(T0_to_1, kpts0, kpts1, K0, K1)
+                        
+                        sigma_match = np.maximum(sigma0,sigma1)
+
+                        all_sigma.append(sigma_match)
+                        all_epi_errs.append(epi_errs.cpu().numpy())
+                        
+                        
+                        
                         if scene_ind % plot_every_iter == 0 and plot:
 
                             if not os.path.exists(f'outputs/mega_1500/{model_name}_{method}'):
@@ -203,7 +217,11 @@ class MegaDepthPoseMNNBenchmark:
                     tot_e_t.append(e_t)
                     tot_e_R.append(e_R)
                     tot_e_pose.append(e_pose)
-                    
+            
+            all_sigma = np.concatenate(all_sigma)
+            all_epi_errs = np.concatenate(all_epi_errs)
+            analyze_variance_precision(all_sigma,all_epi_errs)
+            
             tot_e_pose = np.array(tot_e_pose)
             auc = pose_auc(tot_e_pose, thresholds)
             acc_5 = (tot_e_pose < 5).mean()

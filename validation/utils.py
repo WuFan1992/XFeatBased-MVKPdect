@@ -77,16 +77,54 @@ def compute_relative_pose(R1, t1, R2, t2):
     trans = -rots @ t1 + t2
     return rots, trans
 
-def estimate_pose(kpts0, kpts1, K0, K1, norm_thresh, conf=0.99999):
+def estimate_pose(kpts0, kpts1, K0, K1, norm_thresh, conf=0.99999, sigma0=None, sigma1=None):
     if len(kpts0) < 5:
         return None
     K0inv = np.linalg.inv(K0[:2,:2])
     K1inv = np.linalg.inv(K1[:2,:2])
 
-    kpts0 = (K0inv @ (kpts0-K0[None,:2,2]).T).T 
-    kpts1 = (K1inv @ (kpts1-K1[None,:2,2]).T).T
+    kpts0_n = (K0inv @ (kpts0-K0[None,:2,2]).T).T 
+    kpts1_n = (K1inv @ (kpts1-K1[None,:2,2]).T).T
+    
+    # ===========================
+    # ⭐ Sigma-aware weighting
+    # ===========================
+    
+    
+    # ============================
+    # ⭐ soft weighting (NOT filtering)
+    # ============================
+    if sigma0 is not None:
+
+        sigma = 0.5 * (sigma0 + sigma1)
+
+        # soft weight, NOT sampling
+        w = 1.0 / (1.0 + sigma)
+
+        w = w / (w.sum() + 1e-8)
+
+        # 只做“重复采样增强稳定性”
+        idx = np.random.choice(len(kpts0_n),
+                               size=len(kpts0_n),
+                               replace=True,
+                               p=w)
+
+        kpts0_n = kpts0_n[idx]
+        kpts1_n = kpts1_n[idx]
+
     E, mask = cv2.findEssentialMat(
-        kpts0, kpts1, np.eye(3), threshold=norm_thresh, prob=conf
+        kpts0_n,
+        kpts1_n,
+        np.eye(3),
+        threshold=norm_thresh,
+        prob=conf,
+        method=cv2.RANSAC
+    )
+
+    
+    
+    E, mask = cv2.findEssentialMat(
+        kpts0_n, kpts1_n, np.eye(3), threshold=norm_thresh, prob=conf, method=cv2.RANSAC
     )
 
     ret = None
@@ -94,7 +132,7 @@ def estimate_pose(kpts0, kpts1, K0, K1, norm_thresh, conf=0.99999):
         best_num_inliers = 0
 
         for _E in np.split(E, len(E) / 3):
-            n, R, t, _ = cv2.recoverPose(_E, kpts0, kpts1, np.eye(3), 1e9, mask=mask)
+            n, R, t, _ = cv2.recoverPose(_E, kpts0_n, kpts1_n, np.eye(3), 1e9, mask=mask)
             if n > best_num_inliers:
                 best_num_inliers = n
                 ret = (R, t, mask.ravel() > 0)
@@ -112,4 +150,42 @@ def dynamic_alpha(n_matches,
         return _range[0]
     return _range[1] + (milestones[loc + 1] - n_matches) / (
         milestones[loc + 1] - milestones[loc]) * (_range[0] - _range[1])
-    
+
+
+
+
+
+def analyze_variance_precision(
+    sigma,
+    epi_errs,
+    conf_thr=1e-4,
+    bins=10
+):
+
+    correct = epi_errs < conf_thr
+
+    edges = np.linspace(
+        sigma.min(),
+        sigma.max(),
+        bins + 1
+    )
+
+    print("\n===== Variance Analysis =====")
+
+    for i in range(bins):
+
+        mask = (
+            (sigma >= edges[i]) &
+            (sigma < edges[i+1])
+        )
+
+        if mask.sum() < 20:
+            continue
+
+        precision = correct[mask].mean()
+
+        print(
+            f"sigma[{edges[i]:.3f}, {edges[i+1]:.3f}] "
+            f"N={mask.sum():6d} "
+            f"precision={precision*100:.2f}%"
+        )

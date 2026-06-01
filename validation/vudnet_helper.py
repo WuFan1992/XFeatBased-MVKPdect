@@ -2,6 +2,8 @@ from modules.vudnet import *
 import cv2
 import matplotlib.pyplot as plt
 
+from validation.utils import *
+
 def visualize_vudnet_matches(img1, img2, mkpts1, mkpts2):
     """
     img1, img2: numpy (H,W,3)
@@ -57,13 +59,14 @@ class VUDNet_helper(nn.Module):
         img2 = self.load_image(img2_path)
 
         # 👉 VUDNet 通常自带 detect + describe + match
-        kpts0, kpts1 = self.model.match_vudnet(img1, img2)
+        kpts0, kpts1, sigma0, sigma1 = self.model.match_vudnet(img1, img2)
        
         # ✅ 和你原接口对齐
         if len(kpts0) == 0:
             return np.zeros((0,2)), np.zeros((0,2)), np.array([]), np.array([])
         
+
         # Debug
         #visualize_vudnet_matches(img1, img2, kpts0, kpts1)
 
-        return kpts0, kpts1, None, None
+        return kpts0, kpts1, sigma0, sigma1

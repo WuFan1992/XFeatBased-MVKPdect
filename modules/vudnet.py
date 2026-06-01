@@ -14,7 +14,7 @@ class VUDNet(nn.Module):
         It supports inference for both sparse and semi-dense feature extraction & matching.
     """
 
-    def __init__(self, weights = os.path.abspath(os.path.dirname(__file__)) + '/../checkpoints/iter1/vudnet_megadepth_10000.pth', top_k = 4096, detection_threshold=0.05):
+    def __init__(self, weights = os.path.abspath(os.path.dirname(__file__)) + '/../checkpoints/iter1/vudnet_desc_hardmining_otherview_neigbour_10000.pth', top_k = 4096, detection_threshold=0.05):
         super().__init__()
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.net = VUDNetModel().to(self.dev).eval()
@@ -71,7 +71,13 @@ class VUDNet(nn.Module):
         #Compute reliability scores
         _nearest = InterpolateSparse2d('nearest')
         _bilinear = InterpolateSparse2d('bilinear')
+        
+        #Get variance
+        variances = _bilinear(V1, mkpts, _H1, _W1).squeeze(-1)
+        
+        
         scores = (_nearest(K1h, mkpts, _H1, _W1) * _bilinear(H1, mkpts, _H1, _W1)).squeeze(-1)
+        #scores = (_nearest(K1h, mkpts, _H1, _W1) * _bilinear(H1, mkpts, _H1, _W1) * (1-_bilinear(V1, mkpts, _H1, _W1))).squeeze(-1)
         scores[torch.all(mkpts == 0, dim=-1)] = -1
 
         #Select top-k features
@@ -80,6 +86,7 @@ class VUDNet(nn.Module):
         mkpts_y  = torch.gather(mkpts[...,1], -1, idxs)[:, :top_k]
         mkpts = torch.cat([mkpts_x[...,None], mkpts_y[...,None]], dim=-1)
         scores = torch.gather(scores, -1, idxs)[:, :top_k]
+        variances = torch.gather(variances,-1,idxs)[:, :top_k]
 
         #Interpolate descriptors at kpts positions
         feats = self.interpolator(M1, mkpts, H = _H1, W = _W1)
@@ -91,10 +98,12 @@ class VUDNet(nn.Module):
         mkpts = mkpts * torch.tensor([rw1,rh1], device=mkpts.device).view(1, 1, -1)
 
         valid = scores > 0
+        
         return [  
                    {'keypoints': mkpts[b][valid[b]],
                     'scores': scores[b][valid[b]],
-                    'descriptors': feats[b][valid[b]]} for b in range(B) 
+                    'descriptors': feats[b][valid[b]],
+                    'variance': variances[b][valid[b]]} for b in range(B) 
                ]
     
     @torch.inference_mode()
@@ -118,7 +127,7 @@ class VUDNet(nn.Module):
 
         idxs0, idxs1 = self.match(out1['descriptors'], out2['descriptors'], min_cossim=min_cossim )
 
-        return out1['keypoints'][idxs0].cpu().numpy(), out2['keypoints'][idxs1].cpu().numpy()
+        return out1['keypoints'][idxs0].cpu().numpy(), out2['keypoints'][idxs1].cpu().numpy(), out1['variance'][idxs0].cpu().numpy(), out2['variance'][idxs1].cpu().numpy()
 
 
     def preprocess_tensor(self, x):
@@ -200,6 +209,7 @@ class VUDNet(nn.Module):
 
         cossim = feats1 @ feats2.t()
         cossim_t = feats2 @ feats1.t()
+
         
         _, match12 = cossim.max(dim=1)
         _, match21 = cossim_t.max(dim=1)
