@@ -85,32 +85,6 @@ def estimate_pose(kpts0, kpts1, K0, K1, norm_thresh, conf=0.99999, sigma0=None, 
 
     kpts0_n = (K0inv @ (kpts0-K0[None,:2,2]).T).T 
     kpts1_n = (K1inv @ (kpts1-K1[None,:2,2]).T).T
-    
-    # ===========================
-    # ⭐ Sigma-aware weighting
-    # ===========================
-    
-    
-    # ============================
-    # ⭐ soft weighting (NOT filtering)
-    # ============================
-    if sigma0 is not None:
-
-        sigma = 0.5 * (sigma0 + sigma1)
-
-        # soft weight, NOT sampling
-        w = 1.0 / (1.0 + sigma)
-
-        w = w / (w.sum() + 1e-8)
-
-        # 只做“重复采样增强稳定性”
-        idx = np.random.choice(len(kpts0_n),
-                               size=len(kpts0_n),
-                               replace=True,
-                               p=w)
-
-        kpts0_n = kpts0_n[idx]
-        kpts1_n = kpts1_n[idx]
 
     E, mask = cv2.findEssentialMat(
         kpts0_n,
@@ -121,21 +95,54 @@ def estimate_pose(kpts0, kpts1, K0, K1, norm_thresh, conf=0.99999, sigma0=None, 
         method=cv2.RANSAC
     )
 
-    
-    
-    E, mask = cv2.findEssentialMat(
-        kpts0_n, kpts1_n, np.eye(3), threshold=norm_thresh, prob=conf, method=cv2.RANSAC
-    )
-
     ret = None
     if E is not None:
         best_num_inliers = 0
+        if E.ndim == 2:
+            essential_matrices = [E]
+        else:
+            essential_matrices = np.split(E, E.shape[0] // 3)
 
-        for _E in np.split(E, len(E) / 3):
+        for _E in essential_matrices:
             n, R, t, _ = cv2.recoverPose(_E, kpts0_n, kpts1_n, np.eye(3), 1e9, mask=mask)
             if n > best_num_inliers:
                 best_num_inliers = n
                 ret = (R, t, mask.ravel() > 0)
+
+        # ===========================
+        # ⭐ Sigma-based trimming for robust pose
+        # ===========================
+        if ret is not None and sigma0 is not None and sigma1 is not None:
+            sigma0 = np.asarray(sigma0).ravel()
+            sigma1 = np.asarray(sigma1).ravel()
+            if sigma0.shape[0] == len(kpts0) and sigma1.shape[0] == len(kpts1):
+                sigma_match = np.maximum(sigma0, sigma1)
+                if len(sigma_match) >= 40:
+                    trim_thr = np.percentile(sigma_match, 95)
+                    keep = sigma_match <= trim_thr
+                    if keep.sum() >= max(40, int(len(sigma_match) * 0.80)):
+                        E2, mask2 = cv2.findEssentialMat(
+                            kpts0_n[keep],
+                            kpts1_n[keep],
+                            np.eye(3),
+                            threshold=norm_thresh,
+                            prob=conf,
+                            method=cv2.RANSAC
+                        )
+                        if E2 is not None:
+                            best_num_inliers2 = 0
+                            ret2 = None
+                            if E2.ndim == 2:
+                                essential_matrices2 = [E2]
+                            else:
+                                essential_matrices2 = np.split(E2, E2.shape[0] // 3)
+                            for _E2 in essential_matrices2:
+                                n2, R2, t2, _ = cv2.recoverPose(_E2, kpts0_n[keep], kpts1_n[keep], np.eye(3), 1e9, mask=mask2)
+                                if n2 > best_num_inliers2:
+                                    best_num_inliers2 = n2
+                                    ret2 = (R2, t2, mask2.ravel() > 0)
+                            if ret2 is not None and best_num_inliers2 >= max(int(best_num_inliers * 0.95), 30):
+                                ret = ret2
     return ret
 
 def dynamic_alpha(n_matches,

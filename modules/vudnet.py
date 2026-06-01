@@ -75,9 +75,12 @@ class VUDNet(nn.Module):
         #Get variance
         variances = _bilinear(V1, mkpts, _H1, _W1).squeeze(-1)
         
-        
         scores = (_nearest(K1h, mkpts, _H1, _W1) * _bilinear(H1, mkpts, _H1, _W1)).squeeze(-1)
-        #scores = (_nearest(K1h, mkpts, _H1, _W1) * _bilinear(H1, mkpts, _H1, _W1) * (1-_bilinear(V1, mkpts, _H1, _W1))).squeeze(-1)
+        # softly bias towards lower variance keypoints without destroying distribution
+        sigma_min = variances.min(dim=-1, keepdim=True)[0]
+        sigma_max = variances.max(dim=-1, keepdim=True)[0]
+        sigma_norm = (variances - sigma_min) / (sigma_max - sigma_min + 1e-6)
+        scores = scores * (1.0 - 0.12 * sigma_norm)
         scores[torch.all(mkpts == 0, dim=-1)] = -1
 
         #Select top-k features
