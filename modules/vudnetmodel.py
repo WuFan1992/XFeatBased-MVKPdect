@@ -40,6 +40,54 @@ class BasicLayer(nn.Module):
 
     def forward(self, x):
         return self.layer(x)
+    
+class AdaptiveFusion(nn.Module):
+
+    def __init__(self, channels=64):
+        super().__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(
+                channels * 3,
+                channels,
+                3,
+                padding=1,
+                bias=False
+            ),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+
+        self.weight_head = nn.Conv2d(
+            channels,
+            3,
+            kernel_size=1
+        )
+
+    def forward(self, x3, x4, x5):
+
+        cat = torch.cat(
+            [x3, x4, x5],
+            dim=1
+        )
+
+        feat = self.conv(cat)
+
+        weights = F.softmax(
+            self.weight_head(feat),
+            dim=1
+        )
+
+        fused = (
+            weights[:, 0:1] * x3 +
+            weights[:, 1:2] * x4 +
+            weights[:, 2:3] * x5
+        )
+        
+        identity = (x3 + x4 + x5) / 3
+        fused = fused + identity
+
+        return fused, weights
 
 
 class VUDNetModel(nn.Module):
@@ -117,12 +165,20 @@ class VUDNetModel(nn.Module):
         self.proj5 = nn.Conv2d(320, 64, 1)
 
         ########################################
-        # Fusion Block
+        # Adaptive Fusion
+        ########################################
+
+        self.adaptive_fusion = AdaptiveFusion(
+            channels=64
+        )
+
+        ########################################
+        # Fusion Refinement
         ########################################
 
         self.block_fusion = nn.Sequential(
-            BasicLayer(64, 64, stride=1),
-            BasicLayer(64, 64, stride=1),
+            BasicLayer(64, 64),
+            BasicLayer(64, 64),
             nn.Conv2d(64, 64, 1)
         )
 
@@ -243,10 +299,15 @@ class VUDNetModel(nn.Module):
         # pyramid fusion
         ########################################
 
-        feats = self.block_fusion(
-            x3 + x4 + x5
+        fused, fusion_weights = self.adaptive_fusion(
+            x3,
+            x4,
+            x5
         )
 
+        feats = self.block_fusion(
+            fused
+        )
         ########################################
         # heads
         ########################################
