@@ -350,4 +350,91 @@ def multi_view_xfeat_heatmap_loss(
 
 
 
+# ============================================================================
+# INNOVATION 3: Supervised Contrastive Loss v2 (Dynamic Hard Mining)
+# Inspired by: SupCon (Khosla et al), RDD
+# Key idea: Improved version with adaptive hard negative mining and
+# per-sample weighting based on matching difficulty
+# ============================================================================
+def supervised_contrastive_v2(features, labels, temp=0.07, hard_mining_ratio=0.3):
+    """
+    Supervised Contrastive Loss with Dynamic Hard Negative Mining.
+    
+    INNOVATION:
+    - Similar to SupCon but adds hard negative mining for better discrimination
+    - Dynamically selects hardest negatives based on cosine similarity
+    - Per-sample adaptive weighting: harder samples get higher loss weight
+    - Better suited for descriptor learning than standard contrastive loss
+    
+    Args:
+        features: [N, C] L2-normalized feature descriptors
+        labels: [N] class/match labels (same label = same 3D point)
+        temp: temperature parameter (typically 0.07)
+        hard_mining_ratio: ratio of hardest negatives to mine (0.3 = mine top 30% hardest)
+    
+    Returns:
+        loss: scalar loss
+    """
+    N, C = features.shape
+    
+    # ===== Compute pairwise similarity =====
+    sim = torch.einsum('nc,mc->nm', features, features) / temp  # [N, N]
+    
+    # ===== Create positive and negative masks =====
+    # Positive: same label but different sample
+    pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~torch.eye(N, dtype=torch.bool, device=features.device)
+    neg_mask = ~(labels.unsqueeze(0) == labels.unsqueeze(1))
+    
+    # ===== Hard Negative Mining =====
+    # Select hardest (highest similarity) negatives
+    sim_neg = sim.clone()
+    sim_neg[~neg_mask] = -float('inf')  # mask out positives
+    sim_neg[torch.arange(N), torch.arange(N)] = -float('inf')  # mask out self
+    
+    # Get hardest negatives per sample
+    k_hard = max(1, int(N * hard_mining_ratio))
+    _, hard_neg_indices = torch.topk(sim_neg, k=k_hard, dim=1)  # [N, k_hard]
+    hard_neg_mask = torch.zeros_like(neg_mask)
+    hard_neg_mask.scatter_(1, hard_neg_indices, True)
+    
+    # ===== Loss Computation =====
+    loss = 0.0
+    count = 0
+    
+    for i in range(N):
+        # Positive samples
+        pos_sim = sim[i][pos_mask[i]]
+        if pos_sim.shape[0] == 0:
+            continue  # Skip if no positives
+        
+        # Hard negative samples
+        neg_sim = sim[i][hard_neg_mask[i]]
+        if neg_sim.shape[0] == 0:
+            continue  # Skip if no negatives
+        
+        # Concatenate: first are positives
+        logits = torch.cat([pos_sim, neg_sim])  # [L]
+
+        # Multi-positive contrastive loss using log-sum-exp for numerical stability:
+        # loss = -log( sum_exp(pos_sim) / sum_exp(all_sim) )
+        # = -(logsumexp(pos_sim) - logsumexp(logits))
+        if logits.numel() == 0:
+            continue
+
+        lse_all = torch.logsumexp(logits, dim=0)
+        lse_pos = torch.logsumexp(pos_sim, dim=0)
+        loss_i = -(lse_pos - lse_all)
+        
+        # Adaptive weighting: sample difficulty ~ how similar hard negatives are to positives
+        hardness = neg_sim.max().detach() - pos_sim.min().detach()
+        hardness = torch.clamp(hardness, 0.0, 1.0)
+        weight = 1.0 + hardness  # harder samples get more weight
+        
+        loss = loss + weight * loss_i
+        count += 1
+    
+    if count == 0:
+        return torch.tensor(0.0, device=features.device, requires_grad=True)
+    
+    return loss / count
 

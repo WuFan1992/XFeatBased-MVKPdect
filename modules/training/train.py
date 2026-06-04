@@ -400,14 +400,23 @@ class Trainer():
                             radius=24
                         )
                     
-                    loss_desc_pair, conf_pair = dual_softmax_loss(
-                        feat_i, feat_j, 
-                        temp=0.2,
-                        hard_neg_X=hard_neg_feat_i,
-                        hard_neg_Y=hard_neg_feat_j,
-                        hard_neg_weight=0.3,
-                        margin=0.1
+                    # Use supervised contrastive v2 across the pair (no Angular Margin)
+                    # Build a features tensor where each point appears once per view
+                    feats_pair = torch.cat([feat_i, feat_j], dim=0)  # [2M, C]
+                    labels_pair = torch.arange(feat_i.shape[0], device=self.dev).repeat(2)
+
+                    # Normalize features and compute supervised contrastive loss
+                    feats_pair = F.normalize(feats_pair, dim=-1)
+                    loss_desc_pair = supervised_contrastive_v2(
+                        feats_pair,
+                        labels_pair,
+                        temp=0.07,
+                        hard_mining_ratio=0.3
                     )
+
+                    # Compute pairwise confidence from cosine similarity of matched pairs
+                    cos_sim = (feat_i * feat_j).sum(dim=1)  # [-1,1]
+                    conf_pair = torch.sigmoid(cos_sim / 0.1).detach()
                     loss_desc_total += loss_desc_pair
                     loss_hmap_pair = keypoint_loss(hmap_i, conf_pair) + keypoint_loss(hmap_j, conf_pair)
                     loss_hmap_total += loss_hmap_pair
