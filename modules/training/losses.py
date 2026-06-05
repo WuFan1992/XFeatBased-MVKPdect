@@ -349,6 +349,39 @@ def multi_view_xfeat_heatmap_loss(
     return total_loss / total_pairs
 
 
+def _pairwise_supervised_contrastive_v2(X, Y, temp=0.07, hard_mining_ratio=0.3):
+    """Efficient pairwise supervised contrastive loss for two-view matching."""
+    M, C = X.shape
+    if M == 0:
+        return torch.tensor(0.0, device=X.device, requires_grad=True)
+
+    sim = torch.matmul(X, Y.t()) / temp  # [M, M]
+    diag_idx = torch.arange(M, device=X.device)
+    pos_sim = sim[diag_idx, diag_idx]  # [M]
+
+    if M == 1:
+        return torch.tensor(0.0, device=X.device, requires_grad=True)
+
+    neg_sim = sim.clone()
+    neg_sim[diag_idx, diag_idx] = -float('inf')
+
+    k_hard = min(max(1, int(M * hard_mining_ratio)), M - 1)
+    hard_neg_x = neg_sim.topk(k_hard, dim=1).values  # [M, k_hard]
+    logits_x = torch.cat([pos_sim.unsqueeze(1), hard_neg_x], dim=1)
+    loss_x = -(pos_sim - torch.logsumexp(logits_x, dim=1))
+    hardness_x = hard_neg_x.max(dim=1).values.detach() - pos_sim.detach()
+    hardness_x = torch.clamp(hardness_x, 0.0, 1.0)
+    weight_x = 1.0 + hardness_x
+
+    hard_neg_y = neg_sim.t().topk(k_hard, dim=1).values
+    logits_y = torch.cat([pos_sim.unsqueeze(1), hard_neg_y], dim=1)
+    loss_y = -(pos_sim - torch.logsumexp(logits_y, dim=1))
+    hardness_y = hard_neg_y.max(dim=1).values.detach() - pos_sim.detach()
+    hardness_y = torch.clamp(hardness_y, 0.0, 1.0)
+    weight_y = 1.0 + hardness_y
+
+    return ((weight_x * loss_x).mean() + (weight_y * loss_y).mean()) * 0.5
+
 
 # ============================================================================
 # INNOVATION 3: Supervised Contrastive Loss v2 (Dynamic Hard Mining)
@@ -376,59 +409,57 @@ def supervised_contrastive_v2(features, labels, temp=0.07, hard_mining_ratio=0.3
         loss: scalar loss
     """
     N, C = features.shape
-    
+    if N == 0:
+        return torch.tensor(0.0, device=features.device, requires_grad=True)
+
+    # Fast pairwise path for two-view matching with exactly paired labels
+    if N % 2 == 0:
+        half = N // 2
+        if torch.equal(labels[:half], labels[half:]):
+            return _pairwise_supervised_contrastive_v2(
+                features[:half],
+                features[half:],
+                temp=temp,
+                hard_mining_ratio=hard_mining_ratio,
+            )
+
     # ===== Compute pairwise similarity =====
     sim = torch.einsum('nc,mc->nm', features, features) / temp  # [N, N]
     
     # ===== Create positive and negative masks =====
     # Positive: same label but different sample
-    pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~torch.eye(N, dtype=torch.bool, device=features.device)
-    neg_mask = ~(labels.unsqueeze(0) == labels.unsqueeze(1))
+    label_eq = labels.unsqueeze(0) == labels.unsqueeze(1)
+    pos_mask = label_eq & ~torch.eye(N, dtype=torch.bool, device=features.device)
+    neg_mask = ~label_eq
     
     # ===== Hard Negative Mining =====
-    # Select hardest (highest similarity) negatives
     sim_neg = sim.clone()
     sim_neg[~neg_mask] = -float('inf')  # mask out positives
-    sim_neg[torch.arange(N), torch.arange(N)] = -float('inf')  # mask out self
-    
-    # Get hardest negatives per sample
+    diag_idx = torch.arange(N, device=features.device)
+    sim_neg[diag_idx, diag_idx] = -float('inf')  # mask out self
     k_hard = max(1, int(N * hard_mining_ratio))
-    _, hard_neg_indices = torch.topk(sim_neg, k=k_hard, dim=1)  # [N, k_hard]
-    hard_neg_mask = torch.zeros_like(neg_mask)
-    hard_neg_mask.scatter_(1, hard_neg_indices, True)
-    
+    hard_neg_sim = sim_neg.topk(k_hard, dim=1).values
+
     # ===== Loss Computation =====
     loss = 0.0
     count = 0
     
     for i in range(N):
-        # Positive samples
         pos_sim = sim[i][pos_mask[i]]
         if pos_sim.shape[0] == 0:
-            continue  # Skip if no positives
-        
-        # Hard negative samples
-        neg_sim = sim[i][hard_neg_mask[i]]
+            continue
+        neg_sim = hard_neg_sim[i]
         if neg_sim.shape[0] == 0:
-            continue  # Skip if no negatives
-        
-        # Concatenate: first are positives
-        logits = torch.cat([pos_sim, neg_sim])  # [L]
-
-        # Multi-positive contrastive loss using log-sum-exp for numerical stability:
-        # loss = -log( sum_exp(pos_sim) / sum_exp(all_sim) )
-        # = -(logsumexp(pos_sim) - logsumexp(logits))
-        if logits.numel() == 0:
             continue
 
+        logits = torch.cat([pos_sim, neg_sim])
         lse_all = torch.logsumexp(logits, dim=0)
         lse_pos = torch.logsumexp(pos_sim, dim=0)
         loss_i = -(lse_pos - lse_all)
-        
-        # Adaptive weighting: sample difficulty ~ how similar hard negatives are to positives
+
         hardness = neg_sim.max().detach() - pos_sim.min().detach()
         hardness = torch.clamp(hardness, 0.0, 1.0)
-        weight = 1.0 + hardness  # harder samples get more weight
+        weight = 1.0 + hardness
         
         loss = loss + weight * loss_i
         count += 1

@@ -50,8 +50,17 @@ class AdaptiveFusion(nn.Module):
             nn.Conv2d(
                 channels * 3,
                 channels,
+                1,
+                bias=False
+            ),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                channels,
+                channels,
                 3,
                 padding=1,
+                groups=channels,
                 bias=False
             ),
             nn.BatchNorm2d(channels),
