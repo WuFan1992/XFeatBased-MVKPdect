@@ -38,7 +38,7 @@ def parse_arguments():
                         help='Device number to use for training. Default is "0".')
     parser.add_argument('--dry_run', action='store_true',
                         help='If set, perform a dry run training with a mini-batch for sanity check.')
-    parser.add_argument('--save_ckpt_every', type=int, default=500,
+    parser.add_argument('--save_ckpt_every', type=int, default=5000,
                         help='Save checkpoints every N steps. Default is 500.')
 
     args = parser.parse_args()
@@ -116,10 +116,10 @@ class Trainer():
 
         ##################### MEGADEPTH INIT ##########################
         if model_name in ('vudnet_default', 'vudnet_megadepth'):
-            TRAIN_BASE_PATH = f"{megadepth_root_path}/train_data/megadepth_indices"
-            TRAINVAL_DATA_SOURCE = f"{megadepth_root_path}/MegaDepth_v1"
+            TRAIN_BASE_PATH = f"{megadepth_root_path}"
+            TRAINVAL_DATA_SOURCE = f"{megadepth_root_path}/thirtysceneData"
 
-            TRAIN_NPZ_ROOT = f"{TRAIN_BASE_PATH}/scene_info_0.1_0.7"
+            TRAIN_NPZ_ROOT = f"{TRAIN_BASE_PATH}/scene_info_thirtyscene"
 
             npz_paths = glob.glob(TRAIN_NPZ_ROOT + '/*.npz')[:]
             data = torch.utils.data.ConcatDataset( [MegaDepthDataset(root_dir = TRAINVAL_DATA_SOURCE,
