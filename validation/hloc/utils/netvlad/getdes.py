@@ -5,7 +5,7 @@ from PIL import Image
 from validation.hloc.utils.netvlad.netvlad import NetVLAD
 
 
-from validation.hloc.utils.netvlad.utils import image_process
+from validation.hloc.utils.netvlad.utils import image_process, get_registered_images
 
 ###  Command #############
 # python getdes.py -s ../../GSplatLoc/gsplatloc-main/datasets/wholehead/ -m ../../GSplatLoc/gsplatloc-main/output_wholescene/img_2000_head
@@ -13,24 +13,30 @@ from validation.hloc.utils.netvlad.utils import image_process
 
 from tqdm import tqdm
 
-def getNetVladDesc(folder_path, model):
-    
+def getNetVladDesc(folder_path, model, registered_imgs):
+
     imgs_name = []
-    global_desc = [] 
+    global_desc = []
 
-    img_files = [f for f in os.listdir(folder_path) if f.lower().endswith(".jpg")]
 
-    for filename in tqdm(img_files, desc="Extracting NetVLAD"):
-        img_path = os.path.join(folder_path, filename)
-        query_img = Image.open(img_path)
+    for filename in tqdm(sorted(registered_imgs),
+                         desc="Extracting NetVLAD"):
+        img_path = os.path.join(folder_path, filename.replace("png", "jpg"))
+
+
+        if not os.path.exists(img_path):
+            print(f"[Warning] Missing image: {img_path}")
+            continue
+
+        query_img = Image.open(img_path).convert("RGB")
 
         original_image = image_process(query_img)
         image = original_image.cuda()
 
-        with torch.no_grad():  # 👍 推理必须加，省显存+更快
+        with torch.no_grad():
             output = model(image[None])["global_descriptor"]
 
-        global_desc.append(output.detach().cpu())
+        global_desc.append(output.cpu())
         imgs_name.append(filename)
 
     return global_desc, imgs_name
@@ -40,17 +46,21 @@ def getNetVladDesc(folder_path, model):
 
 # Discard layers at the end of base network
 conf = {"model_name": "VGG16-NetVLAD-Pitts30K", "whiten": True}
-db_folder = "datasets/aachen/db/"
+db_folder = "datasets/aachen/"
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = NetVLAD(conf).eval().to(device)
 output_folder = "datasets/aachen/global_desc.pt"
+colmap_model = "datasets/aachen/sparse/0/images.bin"
+registered_imgs = get_registered_images(colmap_model)
+
+print(f"COLMAP registered images: {len(registered_imgs)}")
 
 
 #Prepare the dataset 
 
 
-global_desc, imgs_name = getNetVladDesc(db_folder, model)
+global_desc, imgs_name = getNetVladDesc(db_folder, model, registered_imgs)
 desc_names_tensor = [torch.stack(global_desc), imgs_name]
 torch.save(desc_names_tensor, output_folder)
 
