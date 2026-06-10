@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 from collections import defaultdict
-import glob
+import os
 from modules.dataset.megadepth.utils import read_megadepth_gray, read_megadepth_depth, fix_path_from_d2net
 import numpy.random as rnd
 
@@ -31,10 +31,10 @@ import numpy.random as rnd
 class MegaDepthDataset(Dataset):
     def __init__(self,
                  root_dir,
-                 npz_path,
+                 npz_paths,
                  mode='train',
-                 min_overlap_score = 0.3, #0.3,
-                 max_overlap_score = 0.8, #1,
+                 min_overlap_score = 0.2, #0.3,
+                 max_overlap_score = 0.7, #1,
                  load_depth = True,
                  img_resize = (800,608), #or None
                  df=32,
@@ -75,21 +75,38 @@ class MegaDepthDataset(Dataset):
         super().__init__()
         self.root_dir = root_dir
         self.mode = mode
-        self.scene_id = npz_path.split('.')[0]
+        filename = os.path.basename(npz_paths[0])
+        self.scene_id = filename.split('_')[0]
         self.load_depth = load_depth
         # prepare scene_info and pair_info
         if mode == 'test' and min_overlap_score != 0:
             min_overlap_score = 0
-        self.scene_info = np.load(npz_path, allow_pickle=True)
-        self.pair_infos = self.scene_info['pair_infos'].copy()
-        del self.scene_info['pair_infos']
+                
+        first_scene = np.load(npz_paths[0], allow_pickle=True)
+        self.scene_info = {
+            'image_paths': first_scene['image_paths'],
+            'depth_paths': first_scene['depth_paths'],
+            'intrinsics': first_scene['intrinsics'],
+            'poses': first_scene['poses']}
+          
+        self.pair_infos = []
+        for npz_path in npz_paths:
+            scene = np.load(npz_path, allow_pickle=True)
+            pair_infos = scene['pair_infos']
+            self.pair_infos.extend(pair_infos) 
+        self.pair_infos = [pair_info for pair_info in self.pair_infos if pair_info[1] > min_overlap_score and pair_info[1] < max_overlap_score] 
+            
         self.pair_infos = [pair_info for pair_info in self.pair_infos if pair_info[1] > min_overlap_score and pair_info[1] < max_overlap_score]
 
         # Create graph
         self.graph = defaultdict(list)
+        self.overlap_dict = {}
         for (i, j), overlap, _ in self.pair_infos:
             self.graph[i].append((j, overlap))
             self.graph[j].append((i, overlap))
+            
+            self.overlap_dict[(i,j)] = overlap
+            self.overlap_dict[(j,i)] = overlap
 
 
         # parameters for image resizing, padding and depthmap padding
@@ -114,15 +131,38 @@ class MegaDepthDataset(Dataset):
     
     # Sample 5 views from 
     def sample_five_views(self, anchor):
-        neighbors = [j for j, o in self.graph[anchor] if o > self.min_overlap_score and o < self.max_overlap_score  ]
-        
-        
-        if len(neighbors) < 4:
-            return None
 
-        selected = np.random.choice(neighbors, 4, replace=False)
-        return [anchor] + list(selected)
+        bins = [
+            (0.10, 0.25),
+            (0.25, 0.40),
+            (0.40, 0.55),
+            (0.55, 0.70)
+        ]
 
+        selected_views = []
+        selected_overlaps = []
+
+        neighbors = self.graph[anchor]
+
+        for low, high in bins:
+
+            candidates = [
+                (j, overlap)
+                for j, overlap in neighbors
+                if low <= overlap < high
+            ]
+
+            if len(candidates) == 0:
+                return None
+
+            chosen_idx = np.random.randint(len(candidates))
+
+            view_id, overlap = candidates[chosen_idx]
+
+            selected_views.append(view_id)
+            selected_overlaps.append(overlap)
+
+        return [anchor] + selected_views, selected_overlaps
 
     def __len__(self):
         return len(self.pair_infos)
@@ -137,18 +177,39 @@ class MegaDepthDataset(Dataset):
     
         anchor = idx0
         # 1. 先采样 5 张 view
-        ids_5 = self.sample_five_views(anchor)
-        if ids_5 is None:
-            return self.__getitem__(np.random.randint(len(self)), subset_views=subset_views)
+        result = self.sample_five_views(anchor)
+        if result is None:
+            return self.__getitem__(
+            np.random.randint(len(self)),
+            subset_views=subset_views
+            )
+        ids_5, overlaps_5 = result
     
         # 2. 如果需要子集，从5-view里随机选择
         if subset_views is not None and subset_views < len(ids_5):
-            ids = list(np.random.choice(ids_5, subset_views, replace=False))
-            # 保证 anchor 一定在子集里
-            if anchor not in ids:
-                ids[0] = anchor
+
+            # anchor固定保留
+            remain_ids = ids_5[1:]
+            remain_overlaps = overlaps_5
+
+            selected_idx = np.random.choice(
+                len(remain_ids),
+                subset_views - 1,
+                replace=False
+            )
+
+            ids = [anchor]
+            overlaps = []
+
+            for idx_ in selected_idx:
+                ids.append(remain_ids[idx_])
+                overlaps.append(remain_overlaps[idx_])
+
         else:
             ids = ids_5
+            overlaps = overlaps_5
+        
+        
 
         # 3. 读取 images / depth / Ks / poses / scales / masks
         images, depths, Ks, poses, scales, masks = [], [], [], [], [], []

@@ -11,6 +11,7 @@ import argparse
 import os
 import time
 import sys
+from collections import defaultdict
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="VUDNet training script.")
@@ -116,17 +117,30 @@ class Trainer():
 
         ##################### MEGADEPTH INIT ##########################
         if model_name in ('vudnet_default', 'vudnet_megadepth'):
-            #TRAIN_BASE_PATH = f"{megadepth_root_path}/train_data/megadepth_indices"
-            #TRAINVAL_DATA_SOURCE = f"{megadepth_root_path}/MegaDepth_v1"
+            TRAIN_BASE_PATH = f"{megadepth_root_path}/train_data/megadepth_indices"
+            TRAINVAL_DATA_SOURCE = f"{megadepth_root_path}/MegaDepth_v1"
             
-            TRAIN_BASE_PATH = f"{megadepth_root_path}"
-            TRAINVAL_DATA_SOURCE = f"{megadepth_root_path}/thirtysceneData"
+            #TRAIN_BASE_PATH = f"{megadepth_root_path}"
+            #TRAINVAL_DATA_SOURCE = f"{megadepth_root_path}/thirtysceneData"
 
-            TRAIN_NPZ_ROOT = f"{TRAIN_BASE_PATH}/scene_info_thirtyscene"
-
+            TRAIN_NPZ_ROOT = f"{TRAIN_BASE_PATH}/scene_info_0.1_0.7"
             npz_paths = glob.glob(TRAIN_NPZ_ROOT + '/*.npz')[:]
-            data = torch.utils.data.ConcatDataset( [MegaDepthDataset(root_dir = TRAINVAL_DATA_SOURCE,
-                            npz_path = path) for path in tqdm.tqdm(npz_paths, desc="[MegaDepth] Loading metadata")] )
+            
+            scene_groups = defaultdict(list)
+            for path in npz_paths:
+                filename = os.path.basename(path)
+                scene_id = filename.split('_')[0]
+                scene_groups[scene_id].append(path)
+                
+            datasets = []
+            for scene_id, scene_paths in scene_groups.items():
+                datasets.append(
+                    MegaDepthDataset(
+                    root_dir=TRAINVAL_DATA_SOURCE,
+                    npz_paths=scene_paths
+                ))
+            
+            data = torch.utils.data.ConcatDataset(datasets)
             
             # 一个bacth 里面有10 对匹配图像
             self.data_loader = DataLoader(data, 
