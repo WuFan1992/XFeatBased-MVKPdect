@@ -133,10 +133,10 @@ class MegaDepthDataset(Dataset):
     def sample_five_views(self, anchor):
 
         bins = [
-            (0.10, 0.25),
-            (0.25, 0.40),
-            (0.40, 0.55),
-            (0.55, 0.70)
+            (0.10, 0.20),
+            (0.20, 0.35),
+            (0.35, 0.50),
+            (0.50, 0.70)
         ]
 
         selected_views = []
