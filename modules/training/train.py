@@ -573,7 +573,7 @@ class Trainer():
 
                     # ===== Variance Loss from Multi-View Subsets =====
                     batch_points_dict, id_to_idx = generate_exclusive_subsets(sample_data)
-                    visualize_multi_view_matches(sample_data, batch_points_dict, id_to_idx)
+                    #visualize_multi_view_matches(sample_data, batch_points_dict, id_to_idx)
                     subset_views_list = [5, 4, 3, 2]
                     
                     for k in subset_views_list:

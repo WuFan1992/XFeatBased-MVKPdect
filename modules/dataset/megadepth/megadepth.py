@@ -162,12 +162,18 @@ class MegaDepthDataset(Dataset):
             score += min_selected_dir * 0.8
         return score
 
-    def _pick_pose_diverse_candidate(self, candidates, anchor_pose, selected_poses):
+    def _pick_pose_diverse_candidate(self, candidates, anchor_pose, selected_poses, primary_bin=True):
         best = None
         best_score = -1.0
         for view_id, overlap in candidates:
             candidate_pose = self.scene_info['poses'][view_id]
             score = self._pose_diversity_score(anchor_pose, candidate_pose, selected_poses)
+            if primary_bin:
+                # 先以场景覆盖为主，再考虑重叠区间
+                score += 0.5 * overlap
+            else:
+                # 备用候选时允许 overlap 更高一些
+                score += 0.2 * overlap
             if score > best_score:
                 best_score = score
                 best = (view_id, overlap)
@@ -198,9 +204,18 @@ class MegaDepthDataset(Dataset):
             ]
 
             if len(candidates) == 0:
-                return None
+                # 如果某个 bin 内没有候选，则从剩余邻居中选择最符合姿态覆盖的视角
+                candidates = [
+                    (j, overlap)
+                    for j, overlap in neighbors
+                    if j not in selected_views
+                ]
+                if len(candidates) == 0:
+                    return None
+                picked = self._pick_pose_diverse_candidate(candidates, anchor_pose, selected_poses, primary_bin=False)
+            else:
+                picked = self._pick_pose_diverse_candidate(candidates, anchor_pose, selected_poses, primary_bin=True)
 
-            picked = self._pick_pose_diverse_candidate(candidates, anchor_pose, selected_poses)
             if picked is None:
                 return None
 
@@ -209,7 +224,6 @@ class MegaDepthDataset(Dataset):
             selected_overlaps.append(overlap)
             selected_poses.append(self.scene_info['poses'][view_id])
 
-        print("selected views : ", selected_overlaps)
         return [anchor] + selected_views, selected_overlaps
 
     def __len__(self):
