@@ -127,7 +127,52 @@ class MegaDepthDataset(Dataset):
         for idx in range(len(self.scene_info['depth_paths'])):
             self.scene_info['depth_paths'][idx] = fix_path_from_d2net(self.scene_info['depth_paths'][idx])
         
-    
+    def _angle_between_vectors(self, a, b, eps=1e-8):
+        a = np.asarray(a, dtype=np.float32)
+        b = np.asarray(b, dtype=np.float32)
+        na = np.linalg.norm(a)
+        nb = np.linalg.norm(b)
+        if na < eps or nb < eps:
+            return 0.0
+        cos = np.clip(np.dot(a, b) / (na * nb), -1.0, 1.0)
+        return float(np.rad2deg(np.arccos(cos)))
+
+    def _camera_pose_info(self, pose):
+        pose = np.asarray(pose, dtype=np.float32)
+        R = pose[:3, :3]
+        t = pose[:3, 3]
+        forward = R @ np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        return t, forward
+
+    def _pose_diversity_score(self, anchor_pose, candidate_pose, selected_poses):
+        c0, d0 = self._camera_pose_info(anchor_pose)
+        c1, d1 = self._camera_pose_info(candidate_pose)
+
+        dir_angle = self._angle_between_vectors(d0, d1)
+        trans_vec = c1 - c0
+        trans_angle = self._angle_between_vectors(trans_vec, d0)
+        trans_angle = min(trans_angle, 180.0 - trans_angle)
+
+        score = dir_angle * 1.8 + trans_angle * 1.0
+        if selected_poses:
+            min_selected_dir = min(
+                self._angle_between_vectors(d1, self._camera_pose_info(p)[1])
+                for p in selected_poses
+            )
+            score += min_selected_dir * 0.8
+        return score
+
+    def _pick_pose_diverse_candidate(self, candidates, anchor_pose, selected_poses):
+        best = None
+        best_score = -1.0
+        for view_id, overlap in candidates:
+            candidate_pose = self.scene_info['poses'][view_id]
+            score = self._pose_diversity_score(anchor_pose, candidate_pose, selected_poses)
+            if score > best_score:
+                best_score = score
+                best = (view_id, overlap)
+        return best
+
     # Sample 5 views from 
     def sample_five_views(self, anchor):
 
@@ -140,27 +185,31 @@ class MegaDepthDataset(Dataset):
 
         selected_views = []
         selected_overlaps = []
+        selected_poses = []
+        anchor_pose = self.scene_info['poses'][anchor]
 
         neighbors = self.graph[anchor]
 
         for low, high in bins:
-
             candidates = [
                 (j, overlap)
                 for j, overlap in neighbors
-                if low <= overlap < high
+                if low <= overlap < high and j not in selected_views
             ]
 
             if len(candidates) == 0:
                 return None
 
-            chosen_idx = np.random.randint(len(candidates))
+            picked = self._pick_pose_diverse_candidate(candidates, anchor_pose, selected_poses)
+            if picked is None:
+                return None
 
-            view_id, overlap = candidates[chosen_idx]
-
+            view_id, overlap = picked
             selected_views.append(view_id)
             selected_overlaps.append(overlap)
+            selected_poses.append(self.scene_info['poses'][view_id])
 
+        print("selected views : ", selected_overlaps)
         return [anchor] + selected_views, selected_overlaps
 
     def __len__(self):
@@ -225,7 +274,7 @@ class MegaDepthDataset(Dataset):
         else:
             ids = ids_5
             overlaps = overlaps_5
-        print("overlaps = ", overlaps)
+
 
         # 3. 读取 images / depth / Ks / poses / scales / masks
         images, depths, Ks, poses, scales, masks = [], [], [], [], [], []
