@@ -33,7 +33,7 @@ class MegaDepthDataset(Dataset):
                  root_dir,
                  npz_paths,
                  mode='train',
-                 min_overlap_score = 0.2, #0.3,
+                 min_overlap_score = 0.1, #0.3,
                  max_overlap_score = 0.7, #1,
                  load_depth = True,
                  img_resize = (800,608), #or None
@@ -94,9 +94,8 @@ class MegaDepthDataset(Dataset):
             scene = np.load(npz_path, allow_pickle=True)
             pair_infos = scene['pair_infos']
             self.pair_infos.extend(pair_infos) 
-        self.pair_infos = [pair_info for pair_info in self.pair_infos if pair_info[1] > min_overlap_score and pair_info[1] < max_overlap_score] 
+        self.pair_infos = [pair_info for pair_info in self.pair_infos if pair_info[1] >= min_overlap_score and pair_info[1] <= max_overlap_score] 
             
-        self.pair_infos = [pair_info for pair_info in self.pair_infos if pair_info[1] > min_overlap_score and pair_info[1] < max_overlap_score]
 
         # Create graph
         self.graph = defaultdict(list)
@@ -173,17 +172,35 @@ class MegaDepthDataset(Dataset):
             如果为 None，返回 5-view。
             如果为 4/3/2，则从采样到的 5-view 中随机选择 subset_views 个。
         """
-        (idx0, idx1), overlap_score, central_matches = self.pair_infos[idx % len(self)]
-    
-        anchor = idx0
-        # 1. 先采样 5 张 view
-        result = self.sample_five_views(anchor)
-        if result is None:
-            return self.__getitem__(
-            np.random.randint(len(self)),
-            subset_views=subset_views
-            )
-        ids_5, overlaps_5 = result
+        # Safely select a pair and sample five views with bounded retries (avoid recursion)
+        if len(self.pair_infos) == 0:
+            raise IndexError('MegaDepthDataset has no pair_infos')
+
+        max_tries = 20
+        tries = 0
+        cur_idx = idx % len(self.pair_infos)
+        while True:
+            (idx0, idx1), overlap_score, central_matches = self.pair_infos[cur_idx]
+            anchor = idx0
+            result = self.sample_five_views(anchor)
+            if result is not None:
+                ids_5, overlaps_5 = result
+                
+                idx = cur_idx
+                break
+            # retry with a random pair
+            tries += 1
+            if tries >= max_tries:
+                # fallback: pick up to 4 neighbors from the graph (if available)
+                neighbors = self.graph.get(anchor, [])
+                if len(neighbors) == 0:
+                    raise IndexError(f"Unable to sample five views for anchor {anchor} after {max_tries} tries")
+                # choose up to 4 neighbors (if fewer, use what we have)
+                selected = [n[0] for n in neighbors[:4]]
+                ids_5 = [anchor] + selected
+                overlaps_5 = [n[1] for n in neighbors[:4]]
+                break
+            cur_idx = np.random.randint(len(self.pair_infos))
     
         # 2. 如果需要子集，从5-view里随机选择
         if subset_views is not None and subset_views < len(ids_5):
@@ -208,8 +225,7 @@ class MegaDepthDataset(Dataset):
         else:
             ids = ids_5
             overlaps = overlaps_5
-        
-        
+        print("overlaps = ", overlaps)
 
         # 3. 读取 images / depth / Ks / poses / scales / masks
         images, depths, Ks, poses, scales, masks = [], [], [], [], [], []
@@ -254,6 +270,8 @@ class MegaDepthDataset(Dataset):
             'dataset_name': 'MegaDepth',
             'scene_id': self.scene_id,
             'view_ids': ids,
-            'all_5view_ids': ids_5  # 可以保留完整5-view的信息
+            'all_5view_ids': ids_5,  # 可以保留完整5-view的信息
+            'pair_idx': int(idx % len(self)),
+            'pair_overlap': float(overlap_score)
         }
         return data

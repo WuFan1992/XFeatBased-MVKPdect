@@ -68,6 +68,140 @@ from modules.dataset.megadepth.megadepth_warper import *
 from modules.dataset.megadepth.utils import *
 from torch.utils.data import Dataset, DataLoader
 
+def plot_multi_view_matches(images, multi_corrs, vis=None, max_points=50, save_path=None):
+    """
+    可视化多视图匹配点轨迹（严格可见性过滤）
+    
+    Args:
+        images: list of images [C,H,W] 或 [H,W] 或 torch.Tensor
+        multi_corrs: [N, V, 2] tensor 或 numpy array
+        vis: [N, V] bool，可见性掩码，如果 None，则默认全部可见
+        max_points: 最大显示点数
+        save_path: 保存路径，如果 None 则 plt.show()
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import torch
+
+    # ===== 转 numpy image =====
+    def to_numpy_image(img):
+        if isinstance(img, torch.Tensor):
+            img = img.detach().cpu().numpy()
+        if img.ndim == 4:  # [B,C,H,W]
+            img = img[0]
+        if img.ndim == 3:
+            if img.shape[0] == 1:
+                img = img[0]
+            elif img.shape[0] == 3:
+                img = np.transpose(img, (1, 2, 0))
+        if img.ndim == 2:
+            img = np.stack([img]*3, axis=-1)
+        return img
+
+    imgs = [to_numpy_image(img) for img in images]
+    V = len(imgs)
+
+    H_list = [img.shape[0] for img in imgs]
+    W_list = [img.shape[1] for img in imgs]
+
+    H = max(H_list)
+    W = sum(W_list)
+
+    canvas = np.zeros((H, W, 3), dtype=imgs[0].dtype)
+    offsets = []
+    cur_w = 0
+    for img in imgs:
+        h, w = img.shape[:2]
+        canvas[:h, cur_w:cur_w+w] = img
+        offsets.append(cur_w)
+        cur_w += w
+
+    # ===== 转 numpy 数据 =====
+    if isinstance(multi_corrs, torch.Tensor):
+        multi_corrs = multi_corrs.detach().cpu().numpy()
+    if vis is None:
+        vis = np.ones((multi_corrs.shape[0], V), dtype=bool)
+    elif isinstance(vis, torch.Tensor):
+        vis = vis.detach().cpu().numpy()
+
+    N = multi_corrs.shape[0]
+    if N == 0:
+        print("No correspondences")
+        return
+
+    if N > max_points:
+        idx = np.random.choice(N, max_points, replace=False)
+        multi_corrs = multi_corrs[idx]
+        vis = vis[idx]
+        N = max_points
+
+    # ===== 绘制 =====
+    plt.figure(figsize=(15, 5))
+    plt.imshow(canvas)
+    colors = plt.cm.jet(np.linspace(0, 1, N))
+
+    for i in range(N):
+        # 检查该点在所有视图中是否都可见且在图像内
+        keep_track = True
+        for j in range(V):
+            x, y = multi_corrs[i, j]
+            h, w = imgs[j].shape[:2]
+            if not vis[i, j] or x < 0 or x >= w or y < 0 or y >= h:
+                keep_track = False
+                break
+
+        if not keep_track:
+            continue  # 只保留完全可见的轨迹
+
+        # 画点和连线
+        prev_pt = None
+        for j in range(V):
+            x, y = multi_corrs[i, j]
+            plt.scatter(x + offsets[j], y, c=[colors[i]], s=20)
+            if prev_pt is not None:
+                x0, y0, j0 = prev_pt
+                plt.plot([x0 + offsets[j0], x + offsets[j]], [y0, y], c=colors[i], linewidth=1)
+            prev_pt = (x, y, j)
+
+    plt.axis('off')
+    plt.title(f"Multi-view Correspondences ({V} views)")
+    if save_path is not None:
+        plt.savefig(save_path)
+        plt.close()
+    else:
+        plt.show(block=True)
+
+def visualize_multi_view_matches(batch_data, batch_points_dict, id_to_idx):
+    """
+    可视化多视图匹配子集
+    """
+    images_vis = []
+    for img in batch_data['images']:
+        if isinstance(img, torch.Tensor) and img.dim() == 4:
+            images_vis.append(img[0])
+        else:
+            images_vis.append(img)
+
+    for k in sorted(batch_points_dict.keys(), reverse=True):
+        subset_ids, (corrs_k, vis_k) = batch_points_dict[k]
+        if corrs_k.shape[0] == 0:
+            print(f"[VIS] No {k}-view points")
+            continue
+
+        # 图像顺序和 subset 对齐
+        imgs_k = [images_vis[id_to_idx[i]] for i in subset_ids]
+
+        if vis_k is not None:
+            vis_k = vis_k.astype(bool) if isinstance(vis_k, np.ndarray) else vis_k.bool()
+
+        plot_multi_view_matches(
+            images=imgs_k,
+            multi_corrs=corrs_k,
+            vis=vis_k,
+            max_points=50,
+            save_path=None
+        )
+
 
 class Trainer():
     """
@@ -312,18 +446,17 @@ class Trainer():
 
         with tqdm.tqdm(total=self.steps) as pbar:
             for i in range(self.steps):
-                if not self.dry_run:
-                    if self.data_iter is not None:
-                        try:
-                            # Get the next MD batch
-                            d = next(self.data_iter)
 
-                        except StopIteration:
-                            print("End of DATASET!")
-                            # If StopIteration is raised, create a new iterator.
-                            self.data_iter = iter(self.data_loader)
-                            d = next(self.data_iter)
+                if self.data_iter is not None:
+                    try:
+                        # Get the next MD batch
+                        d = next(self.data_iter)
 
+                    except StopIteration:
+                        print("End of DATASET!")
+                        # If StopIteration is raised, create a new iterator.
+                        self.data_iter = iter(self.data_loader)
+                        d = next(self.data_iter)
                 
                 loss_desc_total = torch.zeros([], device=self.dev)
                 loss_hmap_total = torch.zeros([], device=self.dev)
@@ -440,6 +573,7 @@ class Trainer():
 
                     # ===== Variance Loss from Multi-View Subsets =====
                     batch_points_dict, id_to_idx = generate_exclusive_subsets(sample_data)
+                    visualize_multi_view_matches(sample_data, batch_points_dict, id_to_idx)
                     subset_views_list = [5, 4, 3, 2]
                     
                     for k in subset_views_list:
@@ -447,6 +581,9 @@ class Trainer():
                             continue
                         
                         subset_ids, (corrs_k, vis_k) = batch_points_dict[k]
+                        if subset_ids is None or len(subset_ids) < k:
+                            continue
+                        
                         N_points = corrs_k.shape[0] if corrs_k is not None else 0
                         
                         if N_points < 20:
