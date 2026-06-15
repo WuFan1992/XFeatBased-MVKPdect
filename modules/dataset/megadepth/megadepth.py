@@ -94,8 +94,27 @@ class MegaDepthDataset(Dataset):
             scene = np.load(npz_path, allow_pickle=True)
             pair_infos = scene['pair_infos']
             self.pair_infos.extend(pair_infos) 
-        self.pair_infos = [pair_info for pair_info in self.pair_infos if pair_info[1] >= min_overlap_score and pair_info[1] <= max_overlap_score] 
-            
+        self.pair_infos = [pair_info for pair_info in self.pair_infos if pair_info[1] >= min_overlap_score and pair_info[1] <= max_overlap_score]
+
+        self.overlap_bins = [
+            (0.10, 0.20),
+            (0.20, 0.35),
+            (0.35, 0.50),
+            (0.50, 0.70),
+        ]
+        self.view_group_patterns = [
+            [0],        # 只来自 bin 0
+            [0, 1],     # bin 0 + bin 1
+            [0, 1, 2],  # bin 0 + bin 1 + bin 2
+            [0, 1, 2, 3],
+            [1],        # 只来自 bin 1
+            [1, 2],     # bin 1 + bin 2
+            [1, 2, 3],  # bin 1 + bin 2 + bin 3
+            [2],        # 只来自 bin 2
+            [2, 3],     # bin 2 + bin 3
+            [3],        # 只来自 bin 3
+        ]
+        self.pattern_count = len(self.view_group_patterns)
 
         # Create graph
         self.graph = defaultdict(list)
@@ -179,61 +198,94 @@ class MegaDepthDataset(Dataset):
                 best = (view_id, overlap)
         return best
 
-    # Sample 5 views from 
-    def sample_five_views(self, anchor):
+    def _get_candidates_by_bin(self, neighbors):
+        candidates_by_bin = {i: [] for i in range(len(self.overlap_bins))}
+        for j, overlap in neighbors:
+            for bin_idx, (low, high) in enumerate(self.overlap_bins):
+                if low <= overlap < high:
+                    candidates_by_bin[bin_idx].append((j, overlap))
+                    break
+        return candidates_by_bin
 
-        bins = [
-            (0.10, 0.20),
-            (0.20, 0.35),
-            (0.35, 0.50),
-            (0.50, 0.70)
-        ]
+    def _select_views_for_pattern(self, anchor, pattern, neighbors):
+        anchor_pose = self.scene_info['poses'][anchor]
+        candidates_by_bin = self._get_candidates_by_bin(neighbors)
 
         selected_views = []
         selected_overlaps = []
         selected_poses = []
-        anchor_pose = self.scene_info['poses'][anchor]
 
-        neighbors = self.graph[anchor]
-
-        for low, high in bins:
-            candidates = [
-                (j, overlap)
-                for j, overlap in neighbors
-                if low <= overlap < high and j not in selected_views
-            ]
-
-            if len(candidates) == 0:
-                # 如果某个 bin 内没有候选，则从剩余邻居中选择最符合姿态覆盖的视角
-                candidates = [
-                    (j, overlap)
-                    for j, overlap in neighbors
-                    if j not in selected_views
-                ]
-                if len(candidates) == 0:
-                    return None
-                picked = self._pick_pose_diverse_candidate(candidates, anchor_pose, selected_poses, primary_bin=False)
-            else:
-                picked = self._pick_pose_diverse_candidate(candidates, anchor_pose, selected_poses, primary_bin=True)
-
+        # 1) 尝试先从每个指定 bin 中选一个视角
+        for bin_idx in pattern:
+            candidates = [c for c in candidates_by_bin[bin_idx] if c[0] not in selected_views]
+            if not candidates:
+                continue
+            picked = self._pick_pose_diverse_candidate(candidates, anchor_pose, selected_poses, primary_bin=True)
             if picked is None:
-                return None
-
+                continue
             view_id, overlap = picked
             selected_views.append(view_id)
             selected_overlaps.append(overlap)
             selected_poses.append(self.scene_info['poses'][view_id])
 
+        # 2) 如果仍未选满 4 个视角，则在允许的 bins 中继续填充
+        allowed_candidates = [
+            c for bin_idx in pattern
+            for c in candidates_by_bin[bin_idx]
+            if c[0] not in selected_views
+        ]
+        while len(selected_views) < 4 and allowed_candidates:
+            picked = self._pick_pose_diverse_candidate(allowed_candidates, anchor_pose, selected_poses, primary_bin=True)
+            if picked is None:
+                break
+            view_id, overlap = picked
+            selected_views.append(view_id)
+            selected_overlaps.append(overlap)
+            selected_poses.append(self.scene_info['poses'][view_id])
+            allowed_candidates = [c for c in allowed_candidates if c[0] != view_id]
+
+        # 3) 如果仍未选满，则从所有剩余邻居中补齐
+        fallback_candidates = [(j, overlap) for j, overlap in neighbors if j not in selected_views]
+        while len(selected_views) < 4 and fallback_candidates:
+            picked = self._pick_pose_diverse_candidate(fallback_candidates, anchor_pose, selected_poses, primary_bin=False)
+            if picked is None:
+                break
+            view_id, overlap = picked
+            selected_views.append(view_id)
+            selected_overlaps.append(overlap)
+            selected_poses.append(self.scene_info['poses'][view_id])
+            fallback_candidates = [c for c in fallback_candidates if c[0] != view_id]
+
+        if len(selected_views) < 4:
+            return None
+
         return [anchor] + selected_views, selected_overlaps
 
+    # Sample 5 views from 
+    def sample_five_views(self, anchor, pattern_idx=None):
+        if pattern_idx is None:
+            pattern_idx = np.random.randint(len(self.view_group_patterns))
+
+        if pattern_idx < 0 or pattern_idx >= len(self.view_group_patterns):
+            raise ValueError(f'Invalid pattern_idx {pattern_idx}')
+
+        neighbors = self.graph[anchor]
+        if len(neighbors) == 0:
+            return None
+
+        pattern = self.view_group_patterns[pattern_idx]
+        return self._select_views_for_pattern(anchor, pattern, neighbors)
+
     def __len__(self):
-        return len(self.pair_infos)
+        return len(self.pair_infos) * self.pattern_count
 
     def __getitem__(self, idx, subset_views=None):
         """
         subset_views: int, optional
             如果为 None，返回 5-view。
             如果为 4/3/2，则从采样到的 5-view 中随机选择 subset_views 个。
+
+        idx 现在会映射到一个 pair + pattern 组合，保证每个 anchor 在不同模式下都会被采样。
         """
         # Safely select a pair and sample five views with bounded retries (avoid recursion)
         if len(self.pair_infos) == 0:
@@ -241,11 +293,13 @@ class MegaDepthDataset(Dataset):
 
         max_tries = 20
         tries = 0
-        cur_idx = idx % len(self.pair_infos)
+        pair_idx = (idx // self.pattern_count) % len(self.pair_infos)
+        pattern_idx = idx % self.pattern_count
+        cur_idx = pair_idx
         while True:
             (idx0, idx1), overlap_score, central_matches = self.pair_infos[cur_idx]
             anchor = idx0
-            result = self.sample_five_views(anchor)
+            result = self.sample_five_views(anchor, pattern_idx=pattern_idx)
             if result is not None:
                 ids_5, overlaps_5 = result
                 
