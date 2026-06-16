@@ -535,6 +535,14 @@ class Trainer():
                     feat_j = feat_j[mask_valid]
                     hmap_i = hmap_i[mask_valid]
                     hmap_j = hmap_j[mask_valid]
+                    coords_i_valid = coords_i[mask_valid]
+                    coords_j_valid = coords_j[mask_valid]
+
+                    # ===== Extract variance weights for descriptor curriculum =====
+                    var_i = sample_map_at_coords(vars[0], coords_i_valid, H_orig, W_orig).squeeze(-1)
+                    var_j = sample_map_at_coords(vars[1], coords_j_valid, H_orig, W_orig).squeeze(-1)
+                    sigma_pair = (var_i + var_j) / 2.0
+                    variance_weight = 1.0 - torch.clamp(sigma_pair.detach(), 0.0, 1.0)
 
                     # ===== Extract hard negatives from multi-view subsets =====
                     hard_neg_feat_i = None
@@ -556,7 +564,8 @@ class Trainer():
                         hard_neg_X=hard_neg_feat_i,
                         hard_neg_Y=hard_neg_feat_j,
                         hard_neg_weight=0.3,
-                        margin=0.1
+                        margin=0.1,
+                        variance_weight=variance_weight
                     )
                     loss_desc_total += loss_desc_pair
                     loss_hmap_pair = keypoint_loss(hmap_i, conf_pair) + keypoint_loss(hmap_j, conf_pair)

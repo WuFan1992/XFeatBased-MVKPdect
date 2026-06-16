@@ -73,7 +73,7 @@ def mv_infonce_masked(f_inv, visibility, tau=0.2):
     return loss / count
 
 
-def dual_softmax_loss(X, Y, temp = 0.2, hard_neg_X=None, hard_neg_Y=None, hard_neg_weight=0.3, margin=0.1):
+def dual_softmax_loss(X, Y, temp = 0.2, hard_neg_X=None, hard_neg_Y=None, hard_neg_weight=0.3, margin=0.1, variance_weight=None):
     """
     Dual softmax loss with optional hard negative mining from multi-view data.
     
@@ -84,6 +84,9 @@ def dual_softmax_loss(X, Y, temp = 0.2, hard_neg_X=None, hard_neg_Y=None, hard_n
         hard_neg_Y: [M, K, C] hard negative features for view Y
         hard_neg_weight: weight for hard negative loss component
         margin: margin for triplet loss
+        variance_weight: [M] optional variance-based weights for curriculum learning
+                         low variance points (reliable) -> higher weight
+                         high variance points (unreliable) -> lower weight
     
     Returns:
         loss: scalar loss value
@@ -99,8 +102,12 @@ def dual_softmax_loss(X, Y, temp = 0.2, hard_neg_X=None, hard_neg_Y=None, hard_n
 
     target = torch.arange(len(X), device = X.device)
 
-    pair_loss = F.nll_loss(conf_matrix12, target) + \
-                F.nll_loss(conf_matrix21, target)
+    loss_12 = F.nll_loss(conf_matrix12, target, reduction='none')
+    loss_21 = F.nll_loss(conf_matrix21, target, reduction='none')
+    if variance_weight is not None:
+        loss_12 = loss_12 * variance_weight
+        loss_21 = loss_21 * variance_weight
+    pair_loss = loss_12.mean() + loss_21.mean()
 
     # ===== Hard negative loss (multi-view) =====
     hard_loss = torch.tensor(0.0, device=X.device, requires_grad=True)
@@ -119,10 +126,12 @@ def dual_softmax_loss(X, Y, temp = 0.2, hard_neg_X=None, hard_neg_Y=None, hard_n
         
         # Triplet margin loss: max(0, hard_sim - pos_sim + margin)
         # We want: pos_sim > hard_sim (by at least margin)
-        triplet_loss_X = F.relu(hard_sim_X - pos_sim.unsqueeze(1) + margin).mean()
-        triplet_loss_Y = F.relu(hard_sim_Y - pos_sim.unsqueeze(1) + margin).mean()
-        
-        hard_loss = (triplet_loss_X + triplet_loss_Y) / 2.0
+        triplet_loss_X = F.relu(hard_sim_X - pos_sim.unsqueeze(1) + margin).mean(dim=1)
+        triplet_loss_Y = F.relu(hard_sim_Y - pos_sim.unsqueeze(1) + margin).mean(dim=1)
+        if variance_weight is not None:
+            triplet_loss_X = triplet_loss_X * variance_weight
+            triplet_loss_Y = triplet_loss_Y * variance_weight
+        hard_loss = (triplet_loss_X.mean() + triplet_loss_Y.mean()) / 2.0
 
     # ===== Total loss =====
     loss = pair_loss + hard_neg_weight * hard_loss
