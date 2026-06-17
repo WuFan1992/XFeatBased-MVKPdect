@@ -20,7 +20,10 @@ def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1):
         calculable_mask (torch.Tensor): [N, L]
         warped_keypoints0 (torch.Tensor): [N, L, 2] <x0_hat, y1_hat>
     """
-    kpts0_long = kpts0.round().long().clip(0, 2000-1)
+    N, H, W = depth0.shape
+    kpts0_long = kpts0.round().long()
+    kpts0_long[..., 0].clamp_(0, W-1)
+    kpts0_long[..., 1].clamp_(0, H-1)
 
     # 边界深度清0
     depth0[:, 0, :] = 0 ; depth1[:, 0, :] = 0 

@@ -81,18 +81,20 @@ def read_megadepth_gray(path, resize=None, df=None, padding=False, augment_fn=No
     # read image
     image = imread_gray(path, augment_fn)
 
-    # resize image
+    # resize image if requested, otherwise preserve original size
     w, h = image.shape[1], image.shape[0]
 
-    if len(resize) == 2:
+    if resize is None:
+        w_new, h_new = w, h
+    elif isinstance(resize, (tuple, list)) and len(resize) == 2:
         w_new, h_new = resize
     else:
-        resize = resize[0]
+        resize = int(resize)
         w_new, h_new = get_resized_wh(w, h, resize)
         w_new, h_new = get_divisible_wh(w_new, h_new, df)
 
-
-    image = cv2.resize(image, (w_new, h_new))
+    if (w_new, h_new) != (w, h):
+        image = cv2.resize(image, (w_new, h_new))
     scale = torch.tensor([w/w_new, h/h_new], dtype=torch.float)
 
     if padding:  # padding
