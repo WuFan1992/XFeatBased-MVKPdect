@@ -1,7 +1,3 @@
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision.models import mobilenet_v2
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -101,8 +97,9 @@ class AdaptiveFusion(nn.Module):
 
 class VUDNetModel(nn.Module):
 
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, use_desc_adapter=False):
         super().__init__()
+        self.use_desc_adapter = use_desc_adapter
 
         self.norm = nn.InstanceNorm2d(1)
 
@@ -190,6 +187,18 @@ class VUDNetModel(nn.Module):
             BasicLayer(64, 64),
             nn.Conv2d(64, 64, 1)
         )
+
+        ########################################
+        # Descriptor Adapter Head (stage 2)
+        ########################################
+
+        self.desc_adapter = None
+        if use_desc_adapter:
+            self.desc_adapter = nn.Sequential(
+                BasicLayer(64, 64, 1, padding=0),
+                BasicLayer(64, 64, 1, padding=0),
+                nn.Conv2d(64, 64, 1),
+            )
 
         ########################################
         # Heatmap Head
@@ -317,6 +326,8 @@ class VUDNetModel(nn.Module):
         feats = self.block_fusion(
             fused
         )
+        if self.desc_adapter is not None:
+            feats = feats + self.desc_adapter(feats)
         ########################################
         # heads
         ########################################

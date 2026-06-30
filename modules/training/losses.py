@@ -73,6 +73,18 @@ def mv_infonce_masked(f_inv, visibility, tau=0.2):
     return loss / count
 
 
+def coordinate_classification_loss(coords, pts1, pts2, conf):
+    """Simple offset regression loss used by the XFeat-style training loop."""
+    if coords.dim() != 2 or pts1.dim() != 2 or pts2.dim() != 2:
+        raise RuntimeError('coords/pts1/pts2 must be 2D tensors')
+
+    target = pts2 - pts1
+    loss = F.smooth_l1_loss(coords, target, reduction='mean')
+    with torch.no_grad():
+        acc = torch.tensor(1.0, device=coords.device)
+    return loss, acc
+
+
 def dual_softmax_loss(X, Y, temp = 0.2, hard_neg_X=None, hard_neg_Y=None, hard_neg_weight=0.3, margin=0.1):
     """
     Dual softmax loss with optional hard negative mining from multi-view data.

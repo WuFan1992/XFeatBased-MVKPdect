@@ -70,6 +70,79 @@ def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1):
     valid_mask = nonzero_mask #* consistent_mask* covisible_mask 
 
     return valid_mask, w_kpts0
+@torch.no_grad()
+def spvs_coarse(data, scale=8):
+    """Generate coarse correspondences for a pair of images at the feature-map scale."""
+    if not isinstance(data, dict):
+        raise TypeError('data must be a dict')
+
+    image0 = data['image0']
+    image1 = data['image1']
+    depth0 = data['depth0']
+    depth1 = data['depth1']
+    K0 = data['K0']
+    K1 = data['K1']
+    T_0to1 = data['T_0to1']
+
+    if image0.dim() == 3:
+        image0 = image0.unsqueeze(0)
+        image1 = image1.unsqueeze(0)
+        depth0 = depth0.unsqueeze(0)
+        depth1 = depth1.unsqueeze(0)
+        K0 = K0.unsqueeze(0)
+        K1 = K1.unsqueeze(0)
+        T_0to1 = T_0to1.unsqueeze(0)
+
+    B = image0.shape[0]
+    positives = []
+    device = image0.device
+
+    for b in range(B):
+        _, _, H, W = image0[b].shape
+        if H < scale or W < scale:
+            positives.append(torch.empty((0, 4), device=device, dtype=torch.float32))
+            continue
+
+        ys = torch.arange(0, H, scale, device=device)
+        xs = torch.arange(0, W, scale, device=device)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+        grid = torch.stack([grid_x, grid_y], dim=-1).reshape(1, -1, 2)
+
+        valid_fw, warped_01 = warp_kpts(
+            grid,
+            depth0[b:b + 1],
+            depth1[b:b + 1],
+            T_0to1[b:b + 1],
+            K0[b:b + 1],
+            K1[b:b + 1],
+        )
+
+        T_1to0 = torch.inverse(T_0to1[b:b + 1])
+        valid_bw, warped_10 = warp_kpts(
+            warped_01,
+            depth1[b:b + 1],
+            depth0[b:b + 1],
+            T_1to0,
+            K1[b:b + 1],
+            K0[b:b + 1],
+        )
+
+        dist = torch.norm(grid - warped_10, dim=-1)
+        valid_pair = valid_fw & valid_bw & (dist < 1.5)
+        valid_mask = valid_pair[0]
+
+        if valid_mask.sum() == 0:
+            positives.append(torch.empty((0, 4), device=device, dtype=torch.float32))
+            continue
+
+        pts0 = grid[0, valid_mask] / float(scale)
+        pts1 = warped_01[0, valid_mask] / float(scale)
+        corr = torch.cat([pts0, pts1], dim=-1)
+        positives.append(corr)
+
+    return positives
+
+
 def generate_multiview_subsets_noexclude(batch_data, subset_views_list=[5,4,3,2], scale=4):
     """
     生成全量非互斥的多视图匹配子集。

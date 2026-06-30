@@ -17,14 +17,28 @@ class VUDNet(nn.Module):
     def __init__(self, weights = os.path.abspath(os.path.dirname(__file__)) + '/../checkpoints/iter1/vudnet_desc_hardmining_otherview_neigbour_10000.pth', top_k = 4096, detection_threshold=0.05):
         super().__init__()
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.net = VUDNetModel().to(self.dev).eval()
+        use_adapter = isinstance(weights, (list, tuple)) and len(weights) >= 2
+        self.net = VUDNetModel(pretrained=False, use_desc_adapter=use_adapter).to(self.dev).eval()
         self.top_k = top_k
         self.detection_threshold = detection_threshold
 
         if weights is not None:
-            if isinstance(weights, str):
+            if isinstance(weights, (list, tuple)):
+                for idx, weight_path in enumerate(weights):
+                    if isinstance(weight_path, str):
+                        print(f'loading weights[{idx}] from: {weight_path}')
+                        ckpt = torch.load(weight_path, map_location=self.dev)
+                        if isinstance(ckpt, dict) and 'state_dict' in ckpt:
+                            ckpt = ckpt['state_dict']
+                        self.net.load_state_dict(ckpt, strict=False)
+                    else:
+                        self.net.load_state_dict(weight_path, strict=False)
+            elif isinstance(weights, str):
                 print('loading weights from: ' + weights)
-                self.net.load_state_dict(torch.load(weights, map_location=self.dev))
+                ckpt = torch.load(weights, map_location=self.dev)
+                if isinstance(ckpt, dict) and 'state_dict' in ckpt:
+                    ckpt = ckpt['state_dict']
+                self.net.load_state_dict(ckpt)
             else:
                 self.net.load_state_dict(weights)
 
