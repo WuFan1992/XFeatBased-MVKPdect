@@ -70,9 +70,11 @@ def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1):
     valid_mask = nonzero_mask #* consistent_mask* covisible_mask 
 
     return valid_mask, w_kpts0
-@torch.no_grad()
+
+
+"""
 def spvs_coarse(data, scale=8):
-    """Generate coarse correspondences for a pair of images at the feature-map scale."""
+
     if not isinstance(data, dict):
         raise TypeError('data must be a dict')
 
@@ -141,6 +143,84 @@ def spvs_coarse(data, scale=8):
         positives.append(corr)
 
     return positives
+"""
+@torch.no_grad()
+def spvs_coarse(data, scale = 8):
+    """
+        Supervise corresp with dense depth & camera poses
+    """
+
+    # 1. misc
+    device = data['image0'].device
+    N, _, H0, W0 = data['image0'].shape
+    _, _, H1, W1 = data['image1'].shape
+    #scale = 8
+    scale0 = scale * data['scale0'][:, None] if 'scale0' in data else scale
+    scale1 = scale * data['scale1'][:, None] if 'scale1' in data else scale
+    h0, w0, h1, w1 = map(lambda x: x // scale, [H0, W0, H1, W1])
+
+    # 2. warp grids
+    # create kpts in meshgrid and resize them to image resolution
+    grid_pt1_c = create_meshgrid(h1, w1, False, device).reshape(1, h1*w1, 2).repeat(N, 1, 1)    # [N, hw, 2]
+    grid_pt1_i = scale1 * grid_pt1_c
+
+    # warp kpts bi-directionally and check reproj error
+    nonzero_m1, w_pt1_i  =  warp_kpts(grid_pt1_i, data['depth1'], data['depth0'], data['T_1to0'], data['K1'], data['K0']) 
+    nonzero_m2, w_pt1_og =  warp_kpts(   w_pt1_i, data['depth0'], data['depth1'], data['T_0to1'], data['K0'], data['K1']) 
+
+    # 先将图像1投影到图像2，然后投影点再从图像2投影回图像1，用于双向一致性校验
+    dist = torch.linalg.norm( grid_pt1_i - w_pt1_og, dim=-1)
+    mask_mutual = (dist < 1.5) & nonzero_m1 & nonzero_m2
+
+    #_, w_pt1_i = warp_kpts(grid_pt1_i, data['depth1'], data['depth0'], data['T_1to0'], data['K1'], data['K0'])
+    # 构建GT 对应点 
+    """
+    batched_corrs = [
+       [x0,y0,x1,y1], ...
+       ]
+    """
+    batched_corrs = [ torch.cat([w_pt1_i[i, mask_mutual[i]] / data['scale0'][i],
+                       grid_pt1_i[i, mask_mutual[i]] / data['scale1'][i]],dim=-1) for i in range(len(mask_mutual))]
+    
+    # batched_corrs[i] 形状 = (Ni, 4) 每一行: [x0, y0, x1, y1] 图0上的点 (x0,y0) 对应 图1上的点 (x1,y1)
+
+
+    #Remove repeated correspondences - this is important for network convergence
+    # 去重的原因是，很多在相机空间的3D 点，投影到图像平面后，投影点的位置很近，再进行离散的网格处理后，可能会出现不同的3D点投影到
+    # 同一位置
+    corrs = []
+    for pts in batched_corrs:
+        lut_mat12 = torch.ones((h1, w1, 4), device = device, dtype = torch.float32) * -1  # 每个 coarse 像素位置存一个 [x0,y0,x1,y1] 初始化存-1 表示空
+        lut_mat21 = torch.clone(lut_mat12)
+        src_pts = pts[:, :2] / scale
+        tgt_pts = pts[:, 2:] / scale
+        try:
+            # 如果有多个3D 点同时映射到同一个像素位置，自动覆盖从而实现去重的目的
+            # 这里进行了两次去重，一次是src to tgt ，避免one to many 
+            # 第二次是去重是tgt to src 避免many to one
+            lut_mat12[src_pts[:,1].long(), src_pts[:,0].long()] = torch.cat([src_pts, tgt_pts], dim=1)  
+            # 例如有A: (10,20) → (30,40) B: (10,20) → (35,45) 第二次赋值会：覆盖第一次 最终的结果是，一个source 像素只会保留一个匹配
+            mask_valid12 = torch.all(lut_mat12 >= 0, dim=-1)
+            points = lut_mat12[mask_valid12]
+
+            #Target-src check 
+            src_pts, tgt_pts = points[:, :2], points[:, 2:]
+            lut_mat21[tgt_pts[:,1].long(), tgt_pts[:,0].long()] = torch.cat([src_pts, tgt_pts], dim=1)
+            # 例如有A: (10,20) → (30,40) B: (11,20) → (30,40) 第二次赋值会：覆盖第一次 最终的结果是，一个source 像素只会保留一个匹配
+            mask_valid21 = torch.all(lut_mat21 >= 0, dim=-1)
+            points = lut_mat21[mask_valid21]
+
+            corrs.append(points)
+        except:
+            pdb.set_trace()
+            print('..')
+
+    #Plot for debug purposes    
+    # for i in range(len(corrs)):
+    #     plot_corrs(data['image0'][i], data['image1'][i], corrs[i][:, :2]*8, corrs[i][:, 2:]*8)
+
+    return corrs
+
 
 
 def generate_multiview_subsets_noexclude(batch_data, subset_views_list=[5,4,3,2], scale=4):

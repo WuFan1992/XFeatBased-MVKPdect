@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch import optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
+
 
 from modules.vudnetmodel import VUDNetModel
 from modules.dataset.augmentation import *
@@ -16,6 +16,11 @@ from modules.training.utils import *
 from modules.training.losses import *
 from modules.dataset.megadepth.megadepth import MegaDepthDataset
 from modules.dataset.megadepth.megadepth_warper import *
+from modules.dataset.megadepth.utils import *
+
+from tqdm import tqdm
+
+
 
 
 """
@@ -71,11 +76,13 @@ class Stage2Trainer:
         self.steps = n_steps
         self.opt = optim.Adam(filter(lambda x: x.requires_grad, self.net.parameters()), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.opt, step_size=15000, gamma=gamma_steplr)
-
-        TRAIN_BASE_PATH = f"{megadepth_root_path}"
-        TRAINVAL_DATA_SOURCE = f"{megadepth_root_path}/thirtysceneData"
-        TRAIN_NPZ_ROOT = f"{TRAIN_BASE_PATH}/scene_info_thirtyscene"
+        
+        TRAIN_BASE_PATH = f"{megadepth_root_path}/train_data/megadepth_indices"
+        TRAINVAL_DATA_SOURCE = f"{megadepth_root_path}/MegaDepth_v1"
+        TRAIN_NPZ_ROOT = f"{TRAIN_BASE_PATH}/scene_info_0.1_0.7"
         npz_paths = glob.glob(TRAIN_NPZ_ROOT + '/*.npz')[:]
+        
+
         data = torch.utils.data.ConcatDataset([
             MegaDepthDataset(root_dir=TRAINVAL_DATA_SOURCE, npz_path=path)
             for path in tqdm(npz_paths, desc='[MegaDepth] Loading metadata')

@@ -189,7 +189,7 @@ def alike_distill_loss(kpts, img):
 
 def keypoint_loss(heatmap, target):
     # Compute L1 loss
-    target = target.unsqueeze(1)
+    #target = target.unsqueeze(1)
     L1_loss = F.l1_loss(heatmap, target)
     return L1_loss * 3.0
 

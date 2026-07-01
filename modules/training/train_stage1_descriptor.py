@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch import optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
+
 
 from modules.vudnetmodel import VUDNetModel
 from modules.dataset.augmentation import *
@@ -18,6 +18,7 @@ from modules.dataset.megadepth.megadepth_stage1 import MegaDepthStage1Dataset
 from modules.dataset.megadepth.megadepth_warper import *
 
 from modules.dataset.megadepth.utils import *
+from tqdm import tqdm
 
 
 """
@@ -52,7 +53,7 @@ def parse_arguments():
                         help='Device number to use.')
     parser.add_argument('--dry_run', action='store_true',
                         help='Run a short sanity check only.')
-    parser.add_argument('--save_ckpt_every', type=int, default=2000,
+    parser.add_argument('--save_ckpt_every', type=int, default=1000,
                         help='Save checkpoint every N steps.')
     args = parser.parse_args()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.device_num
@@ -88,10 +89,15 @@ class Stage1Trainer:
                 reload_step=4000,
             )
 
-        TRAIN_BASE_PATH = f"{megadepth_root_path}"
-        TRAINVAL_DATA_SOURCE = f"{megadepth_root_path}/thirtysceneData"
-        TRAIN_NPZ_ROOT = f"{TRAIN_BASE_PATH}/scene_info_thirtyscene"
+        TRAIN_BASE_PATH = f"{megadepth_root_path}/train_data/megadepth_indices"
+        TRAINVAL_DATA_SOURCE = f"{megadepth_root_path}/MegaDepth_v1"
+        TRAIN_NPZ_ROOT = f"{TRAIN_BASE_PATH}/scene_info_0.1_0.7"
         npz_paths = glob.glob(TRAIN_NPZ_ROOT + '/*.npz')[:]
+        
+        print(tqdm)
+        print(type(tqdm))
+        
+        
         data = torch.utils.data.ConcatDataset([
             MegaDepthStage1Dataset(root_dir=TRAINVAL_DATA_SOURCE, npz_path=path)
             for path in tqdm(npz_paths, desc='[MegaDepth] Loading metadata')
@@ -145,20 +151,23 @@ class Stage1Trainer:
                     h_coarse, w_coarse = p1s[0].shape[-2] // 8, p1s[0].shape[-1] // 8
                     _, positives_s_coarse = get_corresponding_pts(p1s, p2s, H1, H2, self.augmentor, h_coarse, w_coarse)
 
-                with torch.inference_mode():
+                with torch.no_grad():
+                    """
                     if d is not None:
                         p1 = p1.mean(1, keepdim=True)
                         p2 = p2.mean(1, keepdim=True)
                     if self.augmentor is not None:
                         p1s = p1s.mean(1, keepdim=True)
                         p2s = p2s.mean(1, keepdim=True)
-
+                    
                     if self.augmentor is not None:
                         p1 = torch.cat([p1s, p1], dim=0)
                         p2 = torch.cat([p2s, p2], dim=0)
                         positives_c = positives_s_coarse + positives_md_coarse
                     else:
                         positives_c = positives_md_coarse
+                    """
+                    positives_c = positives_md_coarse
 
                 is_corrupted = False
                 for p in positives_c:
