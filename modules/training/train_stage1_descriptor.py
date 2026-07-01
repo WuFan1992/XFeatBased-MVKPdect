@@ -53,7 +53,7 @@ def parse_arguments():
                         help='Device number to use.')
     parser.add_argument('--dry_run', action='store_true',
                         help='Run a short sanity check only.')
-    parser.add_argument('--save_ckpt_every', type=int, default=1000,
+    parser.add_argument('--save_ckpt_every', type=int, default=10000,
                         help='Save checkpoint every N steps.')
     args = parser.parse_args()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.device_num
@@ -66,7 +66,7 @@ class Stage1Trainer:
                  training_res=(800, 608), device_num='0', dry_run=False,
                  save_ckpt_every=2000):
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.net = VUDNetModel(pretrained=False, use_desc_adapter=False).to(self.dev)
+        self.net = VUDNetModel(pretrained=True, use_desc_adapter=False).to(self.dev)
         self.batch_size = batch_size
         self.steps = n_steps
         self.opt = optim.Adam(filter(lambda x: x.requires_grad, self.net.parameters()), lr=lr)

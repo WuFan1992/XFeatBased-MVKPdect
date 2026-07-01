@@ -249,24 +249,20 @@ class Stage2Trainer:
                 anchor_feats.append(feat_v)
             anchor_feats = torch.stack(anchor_feats, dim=1)  # [N, k, C]
 
-            cluster_feats = []
-            cluster_labels = []
             sample_limit = min(anchor_feats.shape[0], 256)
-            for n in range(sample_limit):
-                visible_views = torch.where(visible[n])[0]
-                if visible_views.numel() < 2:
-                    continue
-                for v_idx in visible_views[:2]:
-                    f = F.normalize(anchor_feats[n, v_idx], dim=-1)
-                    cluster_feats.append(f)
-                    cluster_labels.append(n)
-
-            if len(cluster_feats) < 4:
+            anchor_feats = anchor_feats[:sample_limit]
+            visible = visible[:sample_limit]
+            if anchor_feats.shape[0] < 2:
                 continue
 
-            cluster_feats = torch.stack(cluster_feats, dim=0)
-            cluster_labels = torch.tensor(cluster_labels, device=self.dev)
-            losses.append(supervised_contrastive_v2(cluster_feats, cluster_labels, temp=0.07, hard_mining_ratio=0.3))
+            losses.append(supervised_contrastive_v2(
+                anchor_feats,
+                torch.arange(anchor_feats.shape[0], device=self.dev),
+                temp=0.07,
+                hard_mining_ratio=0.3,
+                visibility=visible,
+                max_views_per_point=min(3, k),
+            ))
 
         if len(losses) == 0:
             return torch.zeros([], device=self.dev, requires_grad=True)

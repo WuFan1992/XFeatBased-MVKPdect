@@ -401,25 +401,76 @@ def _pairwise_supervised_contrastive_v2(X, Y, temp=0.07, hard_mining_ratio=0.3):
 # Key idea: Improved version with adaptive hard negative mining and
 # per-sample weighting based on matching difficulty
 # ============================================================================
-def supervised_contrastive_v2(features, labels, temp=0.07, hard_mining_ratio=0.3):
+def supervised_contrastive_v2(
+    features,
+    labels,
+    temp=0.07,
+    hard_mining_ratio=0.3,
+    visibility=None,
+    max_views_per_point=3,
+):
     """
     Supervised Contrastive Loss with Dynamic Hard Negative Mining.
-    
-    INNOVATION:
-    - Similar to SupCon but adds hard negative mining for better discrimination
-    - Dynamically selects hardest negatives based on cosine similarity
-    - Per-sample adaptive weighting: harder samples get higher loss weight
-    - Better suited for descriptor learning than standard contrastive loss
-    
+
+    This version supports both standard [N, C] descriptors and multi-view input
+    [N, V, C]. For multi-view input, each point can contribute up to
+    ``max_views_per_point`` visible views as separate anchors, which makes the
+    loss use more than two views while keeping the compute bounded.
+
     Args:
-        features: [N, C] L2-normalized feature descriptors
+        features: [N, C] or [N, V, C] L2-normalized feature descriptors
         labels: [N] class/match labels (same label = same 3D point)
         temp: temperature parameter (typically 0.07)
         hard_mining_ratio: ratio of hardest negatives to mine (0.3 = mine top 30% hardest)
-    
+        visibility: [N, V] bool mask for multi-view input
+        max_views_per_point: maximum number of visible views to use per point
+
     Returns:
         loss: scalar loss
     """
+    if features.dim() == 3:
+        N, V, C = features.shape
+        if labels.dim() != 1 or labels.shape[0] != N:
+            raise ValueError('labels must be [N] when features is [N, V, C]')
+
+        if visibility is None:
+            visibility = torch.ones((N, V), device=features.device, dtype=torch.bool)
+        else:
+            visibility = visibility.to(device=features.device, dtype=torch.bool)
+
+        max_views = max(1, min(int(max_views_per_point), V))
+        flat_features = []
+        flat_labels = []
+
+        for n in range(N):
+            vis_views = torch.where(visibility[n])[0]
+            if vis_views.numel() < 2:
+                continue
+
+            if vis_views.numel() <= max_views:
+                chosen_views = vis_views
+            else:
+                chosen_idx = torch.randperm(vis_views.numel(), device=features.device)[:max_views]
+                chosen_views = vis_views[chosen_idx]
+
+            for v_idx in chosen_views:
+                flat_features.append(F.normalize(features[n, int(v_idx)], dim=-1))
+                flat_labels.append(labels[n])
+
+        if len(flat_features) == 0:
+            return torch.tensor(0.0, device=features.device, requires_grad=True)
+
+        flat_features = torch.stack(flat_features, dim=0)
+        flat_labels = torch.tensor(flat_labels, device=features.device, dtype=labels.dtype)
+        return supervised_contrastive_v2(
+            flat_features,
+            flat_labels,
+            temp=temp,
+            hard_mining_ratio=hard_mining_ratio,
+            visibility=None,
+            max_views_per_point=max_views_per_point,
+        )
+
     N, C = features.shape
     if N == 0:
         return torch.tensor(0.0, device=features.device, requires_grad=True)
@@ -437,13 +488,13 @@ def supervised_contrastive_v2(features, labels, temp=0.07, hard_mining_ratio=0.3
 
     # ===== Compute pairwise similarity =====
     sim = torch.einsum('nc,mc->nm', features, features) / temp  # [N, N]
-    
+
     # ===== Create positive and negative masks =====
     # Positive: same label but different sample
     label_eq = labels.unsqueeze(0) == labels.unsqueeze(1)
     pos_mask = label_eq & ~torch.eye(N, dtype=torch.bool, device=features.device)
     neg_mask = ~label_eq
-    
+
     # ===== Hard Negative Mining =====
     sim_neg = sim.clone()
     sim_neg[~neg_mask] = -float('inf')  # mask out positives
@@ -455,7 +506,7 @@ def supervised_contrastive_v2(features, labels, temp=0.07, hard_mining_ratio=0.3
     # ===== Loss Computation =====
     loss = 0.0
     count = 0
-    
+
     for i in range(N):
         pos_sim = sim[i][pos_mask[i]]
         if pos_sim.shape[0] == 0:
@@ -472,12 +523,12 @@ def supervised_contrastive_v2(features, labels, temp=0.07, hard_mining_ratio=0.3
         hardness = neg_sim.max().detach() - pos_sim.min().detach()
         hardness = torch.clamp(hardness, 0.0, 1.0)
         weight = 1.0 + hardness
-        
+
         loss = loss + weight * loss_i
         count += 1
-    
+
     if count == 0:
         return torch.tensor(0.0, device=features.device, requires_grad=True)
-    
+
     return loss / count
 
