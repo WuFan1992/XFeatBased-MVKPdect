@@ -31,6 +31,29 @@ python -m modules.training.train_stage1_descriptor \
 """
 
 
+def _compute_relative_pose_diff(T_0to1, eps=1e-6):
+    """Compute a scalar pose-change proxy from both translation and rotation.
+
+    This function accepts either a single 4x4 pose tensor or a batch of 4x4 poses
+    with shape [B, 4, 4]. For batched input, it returns one scalar per sample.
+    """
+    if T_0to1.dim() == 2 and T_0to1.shape == (4, 4):
+        T_0to1 = T_0to1.unsqueeze(0)
+    elif T_0to1.dim() != 3 or T_0to1.shape[1:] != (4, 4):
+        raise ValueError(f'T_0to1 must have shape [4,4] or [B,4,4], got {tuple(T_0to1.shape)}')
+
+    trans_norm = torch.linalg.norm(T_0to1[:, :3, 3], dim=1).float()
+    R = T_0to1[:, :3, :3]
+    trace = torch.einsum('bij->b', R)  # sum of diagonal elements
+    cos_theta = torch.clamp((trace - 1.0) * 0.5, -1.0 + eps, 1.0 - eps)
+    rot_angle = torch.acos(cos_theta)
+
+    trans_term = trans_norm / (trans_norm + 1.0)
+    rot_term = rot_angle / (torch.pi + eps)
+    pose_diff = 0.5 * trans_term + 0.5 * rot_term
+    return pose_diff
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Stage-1 descriptor/heatmap/reliability training")
     parser.add_argument('--megadepth_root_path', type=str, required=True,
@@ -222,9 +245,11 @@ class Stage1Trainer:
                     # We use the descriptor agreement and the pose change as a simple proxy.
                     with torch.no_grad():
                         T_0to1 = d['T_0to1'].to(self.dev)
-                        pose_diff = torch.linalg.norm(T_0to1[:3, 3]).detach().clamp(min=self.stability_eps)
+                        pose_diff = _compute_relative_pose_diff(T_0to1, eps=self.stability_eps).detach()
+                        if pose_diff.ndim > 0 and pose_diff.numel() > 1:
+                            pose_diff = pose_diff[b]
                         desc_diff = 1.0 - F.cosine_similarity(m1, m2, dim=-1).detach().clamp(-1.0, 1.0)
-                        stability_target = 1.0 / (1.0 + desc_diff / pose_diff)
+                        stability_target = 1.0 / (1.0 + desc_diff / pose_diff.clamp(min=self.stability_eps))
                         stability_target = stability_target.clamp(0.0, 1.0).detach()
 
                     # Regress the variance head to predict this stability score.
