@@ -14,10 +14,11 @@ class VUDNet(nn.Module):
         It supports inference for both sparse and semi-dense feature extraction & matching.
     """
 
-    def __init__(self, weights = os.path.abspath(os.path.dirname(__file__)) + '/../checkpoints/stage1/stage1_10000_pretrained.pth', top_k = 4096, detection_threshold=0.05):
+    def __init__(self, weights = os.path.abspath(os.path.dirname(__file__)) + '/../checkpoints/stage1/stage1_10000_pairstable.pth', top_k = 4096, detection_threshold=0.05):
         super().__init__()
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         use_adapter = isinstance(weights, (list, tuple)) and len(weights) >= 2
+        use_adapter = True
         self.net = VUDNetModel(pretrained=True, use_desc_adapter=use_adapter).to(self.dev).eval()
         self.top_k = top_k
         self.detection_threshold = detection_threshold

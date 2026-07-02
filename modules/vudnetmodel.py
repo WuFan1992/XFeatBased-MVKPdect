@@ -99,7 +99,7 @@ class VUDNetModel(nn.Module):
 
     def __init__(self, pretrained=True, use_desc_adapter=False):
         super().__init__()
-        self.use_desc_adapter = use_desc_adapter
+        self.use_desc_adapter = False
 
         self.norm = nn.InstanceNorm2d(1)
 
@@ -187,18 +187,6 @@ class VUDNetModel(nn.Module):
             BasicLayer(64, 64),
             nn.Conv2d(64, 64, 1)
         )
-
-        ########################################
-        # Descriptor Adapter Head (stage 2)
-        ########################################
-
-        self.desc_adapter = None
-        if use_desc_adapter:
-            self.desc_adapter = nn.Sequential(
-                BasicLayer(64, 64, 1, padding=0),
-                BasicLayer(64, 64, 1, padding=0),
-                nn.Conv2d(64, 64, 1),
-            )
 
         ########################################
         # Heatmap Head
@@ -326,17 +314,14 @@ class VUDNetModel(nn.Module):
         feats = self.block_fusion(
             fused
         )
-        if self.desc_adapter is not None:
-            feats = feats + self.desc_adapter(feats)
+
         ########################################
         # heads
         ########################################
 
         heatmap = self.heatmap_head(feats)
-        
-        #variance = self.variance_head(feats)
         raw_variance = self.variance_head(feats)
-        variance = F.softplus(raw_variance)
+        variance = torch.sigmoid(raw_variance)
 
         x_gray = x.mean(dim=1, keepdim=True)
         keypoints = self.keypoint_head(self._unfold2d(x_gray, ws=8))

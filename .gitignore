@@ -37,3 +37,5 @@ examples/*
 third_party/*
 *.md
 LICENSE
+
+.venv/

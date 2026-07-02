@@ -55,6 +55,12 @@ def parse_arguments():
                         help='Run a short sanity check only.')
     parser.add_argument('--save_ckpt_every', type=int, default=10000,
                         help='Save checkpoint every N steps.')
+    parser.add_argument('--stability_weight', type=float, default=1.0,
+                        help='Weight for stability-aware descriptor supervision.')
+    parser.add_argument('--variance_loss_weight', type=float, default=1.0,
+                        help='Weight for variance regression loss.')
+    parser.add_argument('--stability_eps', type=float, default=1e-6,
+                        help='Small epsilon to stabilize stability normalization.')
     args = parser.parse_args()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.device_num
     return args
@@ -64,7 +70,8 @@ class Stage1Trainer:
     def __init__(self, megadepth_root_path, synthetic_root_path, ckpt_save_path,
                  batch_size=1, n_steps=20000, lr=3e-4, gamma_steplr=0.5,
                  training_res=(800, 608), device_num='0', dry_run=False,
-                 save_ckpt_every=2000):
+                 save_ckpt_every=2000, stability_weight=1.0, variance_loss_weight=1.0,
+                 stability_eps=1e-6):
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.net = VUDNetModel(pretrained=True, use_desc_adapter=False).to(self.dev)
         self.batch_size = batch_size
@@ -93,11 +100,7 @@ class Stage1Trainer:
         TRAINVAL_DATA_SOURCE = f"{megadepth_root_path}/MegaDepth_v1"
         TRAIN_NPZ_ROOT = f"{TRAIN_BASE_PATH}/scene_info_0.1_0.7"
         npz_paths = glob.glob(TRAIN_NPZ_ROOT + '/*.npz')[:]
-        
-        print(tqdm)
-        print(type(tqdm))
-        
-        
+
         data = torch.utils.data.ConcatDataset([
             MegaDepthStage1Dataset(root_dir=TRAINVAL_DATA_SOURCE, npz_path=path)
             for path in tqdm(npz_paths, desc='[MegaDepth] Loading metadata')
@@ -110,6 +113,9 @@ class Stage1Trainer:
         self.dry_run = dry_run
         self.save_ckpt_every = save_ckpt_every
         self.ckpt_save_path = ckpt_save_path
+        self.stability_weight = stability_weight
+        self.variance_loss_weight = variance_loss_weight
+        self.stability_eps = stability_eps
         self.writer = SummaryWriter(ckpt_save_path + f'/logdir/stage1_' + time.strftime('%Y_%m_%d-%H_%M_%S'))
 
 
@@ -177,10 +183,17 @@ class Stage1Trainer:
                 if is_corrupted:
                     continue
 
-                feats1, kpts1, hmap1, _ = self.net(p1)
-                feats2, kpts2, hmap2, _ = self.net(p2)
+                feats1, kpts1, hmap1, var1 = self.net(p1)
+                feats2, kpts2, hmap2, var2 = self.net(p2)
 
                 loss_items = []
+                loss_var = torch.zeros((), device=self.dev)
+                loss_ds = torch.zeros((), device=self.dev)
+                loss_kp = torch.zeros((), device=self.dev)
+                loss_kp_pos = torch.zeros((), device=self.dev)
+                acc_coarse_0 = 0.0
+                acc_coarse = 0.0
+                nb_coarse = 0
                 for b in range(len(positives_c)):
                     pts1, pts2 = positives_c[b][:, :2], positives_c[b][:, 2:]
                     h_feat, w_feat = feats1.shape[-2], feats1.shape[-1]
@@ -196,13 +209,38 @@ class Stage1Trainer:
                     m1 = feats1[b, :, pts1[:, 1].long(), pts1[:, 0].long()].permute(1, 0)
                     m2 = feats2[b, :, pts2[:, 1].long(), pts2[:, 0].long()].permute(1, 0)
 
+                    v1 = var1[b, 0, pts1[:, 1].long(), pts1[:, 0].long()].squeeze(-1)
+                    v2 = var2[b, 0, pts2[:, 1].long(), pts2[:, 0].long()].squeeze(-1)
+
                     h1 = hmap1[b, 0, pts1[:, 1].long(), pts1[:, 0].long()]
                     h2 = hmap2[b, 0, pts2[:, 1].long(), pts2[:, 0].long()]
 
-                    feats_pair = torch.cat([m1, m2], dim=0)
-                    labels_pair = torch.arange(m1.shape[0], device=self.dev).repeat(2)
-                    feats_pair = F.normalize(feats_pair, dim=-1)
-                    loss_ds = supervised_contrastive_v2(feats_pair, labels_pair, temp=0.07, hard_mining_ratio=0.3)
+                    if m1.shape[0] == 0 or m2.shape[0] == 0:
+                        continue
+
+                    # Stability target: higher for more stable points and lower for unstable ones.
+                    # We use the descriptor agreement and the pose change as a simple proxy.
+                    with torch.no_grad():
+                        T_0to1 = d['T_0to1'].to(self.dev)
+                        pose_diff = torch.linalg.norm(T_0to1[:3, 3]).detach().clamp(min=self.stability_eps)
+                        desc_diff = 1.0 - F.cosine_similarity(m1, m2, dim=-1).detach().clamp(-1.0, 1.0)
+                        stability_target = 1.0 / (1.0 + desc_diff / pose_diff)
+                        stability_target = stability_target.clamp(0.0, 1.0).detach()
+
+                    # Regress the variance head to predict this stability score.
+                    variance_target = stability_target.to(self.dev)
+                    variance_pred = torch.clamp(v1 * 0.5 + v2 * 0.5, 0.0, 1.0)
+                    loss_var = F.mse_loss(variance_pred, variance_target)
+
+                    # The descriptor loss is strengthened for points with high stability.
+                    stability_weight = variance_target
+                    loss_ds = weighted_pairwise_descriptor_loss(
+                        m1,
+                        m2,
+                        stability=stability_weight,
+                        temp=0.07,
+                        stability_weight=self.stability_weight,
+                    )
 
                     cos_sim = (m1 * m2).sum(dim=1)
                     conf = torch.sigmoid(cos_sim / 0.1).detach()
@@ -213,6 +251,7 @@ class Stage1Trainer:
                     loss_kp = keypoint_loss(h1, conf) + keypoint_loss(h2, conf)
 
                     loss_items.append(loss_ds.unsqueeze(0))
+                    loss_items.append((self.variance_loss_weight * loss_var).unsqueeze(0))
                     loss_items.append(loss_kp.unsqueeze(0))
                     loss_items.append(loss_kp_pos.unsqueeze(0))
 
@@ -221,8 +260,12 @@ class Stage1Trainer:
 
                 acc_coarse = check_accuracy(m1, m2)
                 nb_coarse = len(m1)
-                loss = torch.cat(loss_items, -1).mean()
+                if len(loss_items) > 0:
+                    loss = torch.cat(loss_items, -1).mean()
+                else:
+                    loss = torch.zeros((), device=self.dev, requires_grad=True)
                 loss_coarse = loss_ds.item()
+                loss_var = loss_var.item()
                 loss_l1 = loss_kp.item()
                 loss_kp_pos = loss_kp_pos.item()
 
@@ -246,6 +289,7 @@ class Stage1Trainer:
                 self.writer.add_scalar('Accuracy/coarse_synth', acc_coarse_0, i)
                 self.writer.add_scalar('Accuracy/coarse_mdepth', acc_coarse, i)
                 self.writer.add_scalar('Loss/coarse', loss_coarse, i)
+                self.writer.add_scalar('Loss/variance', loss_var, i)
                 self.writer.add_scalar('Loss/reliability', loss_l1, i)
                 self.writer.add_scalar('Loss/keypoint_pos', loss_kp_pos, i)
                 self.writer.add_scalar('Count/matches_coarse', nb_coarse, i)
@@ -265,5 +309,8 @@ if __name__ == '__main__':
         device_num=args.device_num,
         dry_run=args.dry_run,
         save_ckpt_every=args.save_ckpt_every,
+        stability_weight=args.stability_weight,
+        variance_loss_weight=args.variance_loss_weight,
+        stability_eps=args.stability_eps,
     )
     trainer.train()

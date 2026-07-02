@@ -85,6 +85,32 @@ def coordinate_classification_loss(coords, pts1, pts2, conf):
     return loss, acc
 
 
+def weighted_pairwise_descriptor_loss(m1, m2, stability, temp=0.07, stability_weight=1.0):
+    """Pairwise descriptor loss with stability-aware re-weighting.
+
+    The loss is a symmetric cross-entropy over the descriptor matching matrix,
+    and points with larger stability receive a larger penalty so that the
+    descriptor is encouraged to be more discriminative when the observation is
+    more stable.
+    """
+    if m1.dim() != 2 or m2.dim() != 2:
+        raise RuntimeError('m1 and m2 must be 2D tensors')
+
+    m1 = F.normalize(m1, dim=-1)
+    m2 = F.normalize(m2, dim=-1)
+
+    logits = (m1 @ m2.t()) / temp
+    labels = torch.arange(logits.size(0), device=logits.device)
+
+    loss12 = F.cross_entropy(logits, labels, reduction='none')
+    loss21 = F.cross_entropy(logits.t(), labels, reduction='none')
+
+    stability = stability.to(logits.device).float().clamp(0.0, 1.0)
+    weights = 1.0 + stability_weight * stability
+    loss = ((loss12 + loss21) * weights).mean()
+    return loss
+
+
 def dual_softmax_loss(X, Y, temp = 0.2, hard_neg_X=None, hard_neg_Y=None, hard_neg_weight=0.3, margin=0.1):
     """
     Dual softmax loss with optional hard negative mining from multi-view data.
