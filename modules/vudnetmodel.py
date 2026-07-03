@@ -189,17 +189,6 @@ class VUDNetModel(nn.Module):
         )
 
         ########################################
-        # Heatmap Head
-        ########################################
-
-        self.heatmap_head = nn.Sequential(
-            BasicLayer(64, 64, 1, padding=0),
-            BasicLayer(64, 64, 1, padding=0),
-            nn.Conv2d(64, 1, 1),
-            nn.Sigmoid()
-        )
-
-        ########################################
         # Keypoint Head
         ########################################
 
@@ -209,8 +198,17 @@ class VUDNetModel(nn.Module):
             BasicLayer(64, 64, 1, padding=0),
             nn.Conv2d(64, 65, 1),
         )
-        
-        
+
+        ########################################
+        # Matchability Head
+        ########################################
+
+        self.matchability_head = nn.Sequential(
+            BasicLayer(64, 64, 1, padding=0),
+            BasicLayer(64, 64, 1, padding=0),
+            nn.Conv2d(64, 1, 1),
+        )
+
         ########################################
         # Variance Head
         ########################################
@@ -243,7 +241,7 @@ class VUDNetModel(nn.Module):
             W // ws
         )
 
-    def forward(self, x):
+    def _forward_impl(self, x):
 
         ########################################
         # grayscale normalization
@@ -319,12 +317,17 @@ class VUDNetModel(nn.Module):
         # heads
         ########################################
 
-        heatmap = self.heatmap_head(feats)
         raw_variance = self.variance_head(feats)
         variance = torch.sigmoid(raw_variance)
-
-        x_gray = x.mean(dim=1, keepdim=True)
+        matchability = torch.sigmoid(self.matchability_head(feats))
         keypoints = self.keypoint_head(self._unfold2d(x_gray, ws=8))
 
-        return feats, keypoints, heatmap, variance
+        return feats, variance, matchability, keypoints
+
+    def forward(self, x):
+        feats, variance, matchability, kpts = self._forward_impl(x)
+        return feats, variance, matchability, kpts
+
+    def forward_with_aux(self, x):
+        return self._forward_impl(x)
     

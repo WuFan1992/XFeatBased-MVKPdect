@@ -14,7 +14,7 @@ class VUDNet(nn.Module):
         It supports inference for both sparse and semi-dense feature extraction & matching.
     """
 
-    def __init__(self, weights = os.path.abspath(os.path.dirname(__file__)) + '/../checkpoints/stage1/stage1_10000_pairstable.pth', top_k = 4096, detection_threshold=0.05):
+    def __init__(self, weights = os.path.abspath(os.path.dirname(__file__)) + '/../checkpoints/stage1/stage1_10000_stable+matchability.pth', top_k = 4096, detection_threshold=0.05):
         super().__init__()
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         use_adapter = isinstance(weights, (list, tuple)) and len(weights) >= 2
@@ -76,8 +76,8 @@ class VUDNet(nn.Module):
 
         B, _, _H1, _W1 = x.shape
         
-        M1, K1, H1, V1 = self.net(x)
-        M1 = F.normalize(M1, dim=1)
+        F1, V1, M1, K1 = self.net(x)
+        F1 = F.normalize(F1, dim=1)
 
         #Convert logits to heatmap and extract kpts
         K1h = self.get_kpts_heatmap(K1)
@@ -90,7 +90,8 @@ class VUDNet(nn.Module):
         #Get variance
         variances = _bilinear(V1, mkpts, _H1, _W1).squeeze(-1)
         
-        scores = (_nearest(K1h, mkpts, _H1, _W1) * _bilinear(H1, mkpts, _H1, _W1)).squeeze(-1)
+        #scores = (_nearest(K1h, mkpts, _H1, _W1) * _bilinear(M1, mkpts, _H1, _W1)).squeeze(-1)
+        scores = (_nearest(K1h, mkpts, _H1, _W1) * _bilinear(M1, mkpts, _H1, _W1) * _bilinear(V1, mkpts, _H1, _W1)).squeeze(-1)
         # softly bias towards lower variance keypoints without destroying distribution
         #sigma_min = variances.min(dim=-1, keepdim=True)[0]
         #sigma_max = variances.max(dim=-1, keepdim=True)[0]
@@ -107,7 +108,7 @@ class VUDNet(nn.Module):
         variances = torch.gather(variances,-1,idxs)[:, :top_k]
 
         #Interpolate descriptors at kpts positions
-        feats = self.interpolator(M1, mkpts, H = _H1, W = _W1)
+        feats = self.interpolator(F1, mkpts, H = _H1, W = _W1)
 
         #L2-Normalize
         feats = F.normalize(feats, dim=-1)

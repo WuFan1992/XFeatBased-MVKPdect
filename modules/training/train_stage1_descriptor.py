@@ -55,7 +55,7 @@ def _compute_relative_pose_diff(T_0to1, eps=1e-6):
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Stage-1 descriptor/heatmap/reliability training")
+    parser = argparse.ArgumentParser(description="Stage-1 descriptor/stability/matchability training")
     parser.add_argument('--megadepth_root_path', type=str, required=True,
                         help='Path to the MegaDepth dataset root directory.')
     parser.add_argument('--synthetic_root_path', type=str, default=None,
@@ -82,6 +82,8 @@ def parse_arguments():
                         help='Weight for stability-aware descriptor supervision.')
     parser.add_argument('--variance_loss_weight', type=float, default=1.0,
                         help='Weight for variance regression loss.')
+    parser.add_argument('--matchability_loss_weight', type=float, default=1.0,
+                        help='Weight for matchability supervision loss.')
     parser.add_argument('--stability_eps', type=float, default=1e-6,
                         help='Small epsilon to stabilize stability normalization.')
     args = parser.parse_args()
@@ -94,7 +96,7 @@ class Stage1Trainer:
                  batch_size=1, n_steps=20000, lr=3e-4, gamma_steplr=0.5,
                  training_res=(800, 608), device_num='0', dry_run=False,
                  save_ckpt_every=2000, stability_weight=1.0, variance_loss_weight=1.0,
-                 stability_eps=1e-6):
+                 matchability_loss_weight=1.0, stability_eps=1e-6):
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.net = VUDNetModel(pretrained=True, use_desc_adapter=False).to(self.dev)
         self.batch_size = batch_size
@@ -138,6 +140,7 @@ class Stage1Trainer:
         self.ckpt_save_path = ckpt_save_path
         self.stability_weight = stability_weight
         self.variance_loss_weight = variance_loss_weight
+        self.matchability_loss_weight = matchability_loss_weight
         self.stability_eps = stability_eps
         self.writer = SummaryWriter(ckpt_save_path + f'/logdir/stage1_' + time.strftime('%Y_%m_%d-%H_%M_%S'))
 
@@ -206,13 +209,13 @@ class Stage1Trainer:
                 if is_corrupted:
                     continue
 
-                feats1, kpts1, hmap1, var1 = self.net(p1)
-                feats2, kpts2, hmap2, var2 = self.net(p2)
+                feats1, var1, match1, kpts1 = self.net.forward_with_aux(p1)
+                feats2, var2, match2, kpts2 = self.net.forward_with_aux(p2)
 
                 loss_items = []
                 loss_var = torch.zeros((), device=self.dev)
                 loss_ds = torch.zeros((), device=self.dev)
-                loss_kp = torch.zeros((), device=self.dev)
+                loss_match = torch.zeros((), device=self.dev)
                 loss_kp_pos = torch.zeros((), device=self.dev)
                 acc_coarse_0 = 0.0
                 acc_coarse = 0.0
@@ -235,8 +238,8 @@ class Stage1Trainer:
                     v1 = var1[b, 0, pts1[:, 1].long(), pts1[:, 0].long()].squeeze(-1)
                     v2 = var2[b, 0, pts2[:, 1].long(), pts2[:, 0].long()].squeeze(-1)
 
-                    h1 = hmap1[b, 0, pts1[:, 1].long(), pts1[:, 0].long()]
-                    h2 = hmap2[b, 0, pts2[:, 1].long(), pts2[:, 0].long()]
+                    m1_match = match1[b, 0, pts1[:, 1].long(), pts1[:, 0].long()].squeeze(-1)
+                    m2_match = match2[b, 0, pts2[:, 1].long(), pts2[:, 0].long()].squeeze(-1)
 
                     if m1.shape[0] == 0 or m2.shape[0] == 0:
                         continue
@@ -252,12 +255,10 @@ class Stage1Trainer:
                         stability_target = 1.0 / (1.0 + desc_diff / pose_diff.clamp(min=self.stability_eps))
                         stability_target = stability_target.clamp(0.0, 1.0).detach()
 
-                    # Regress the variance head to predict this stability score.
                     variance_target = stability_target.to(self.dev)
                     variance_pred = torch.clamp(v1 * 0.5 + v2 * 0.5, 0.0, 1.0)
                     loss_var = F.mse_loss(variance_pred, variance_target)
 
-                    # The descriptor loss is strengthened for points with high stability.
                     stability_weight = variance_target
                     loss_ds = weighted_pairwise_descriptor_loss(
                         m1,
@@ -267,17 +268,18 @@ class Stage1Trainer:
                         stability_weight=self.stability_weight,
                     )
 
-                    cos_sim = (m1 * m2).sum(dim=1)
-                    conf = torch.sigmoid(cos_sim / 0.1).detach()
+                    loss_match = (
+                        stability_aware_matchability_loss(m1_match, variance_target) +
+                        stability_aware_matchability_loss(m2_match, variance_target)
+                    ) * 0.5
 
                     loss_kp_pos1, _ = alike_distill_loss(kpts1[b], p1[b])
                     loss_kp_pos2, _ = alike_distill_loss(kpts2[b], p2[b])
                     loss_kp_pos = (loss_kp_pos1 + loss_kp_pos2) * 2.0
-                    loss_kp = keypoint_loss(h1, conf) + keypoint_loss(h2, conf)
 
                     loss_items.append(loss_ds.unsqueeze(0))
                     loss_items.append((self.variance_loss_weight * loss_var).unsqueeze(0))
-                    loss_items.append(loss_kp.unsqueeze(0))
+                    loss_items.append((self.matchability_loss_weight * loss_match).unsqueeze(0))
                     loss_items.append(loss_kp_pos.unsqueeze(0))
 
                     if b == 0:
@@ -291,7 +293,7 @@ class Stage1Trainer:
                     loss = torch.zeros((), device=self.dev, requires_grad=True)
                 loss_coarse = loss_ds.item()
                 loss_var = loss_var.item()
-                loss_l1 = loss_kp.item()
+                loss_match = loss_match.item()
                 loss_kp_pos = loss_kp_pos.item()
 
                 loss.backward()
@@ -305,8 +307,8 @@ class Stage1Trainer:
                     torch.save(self.net.state_dict(), self.ckpt_save_path + f'/stage1_{i + 1}.pth')
 
                 pbar.set_description(
-                    'Loss: {:.4f} acc_c0 {:.3f} acc_c1 {:.3f} loss_c: {:.3f} loss_kp: {:.3f} #matches_c: {:d} loss_kp_pos: {:.3f}'.format(
-                        loss.item(), acc_coarse_0, acc_coarse, loss_coarse, loss_l1, nb_coarse, loss_kp_pos)
+                    'Loss: {:.4f} acc_c0 {:.3f} acc_c1 {:.3f} loss_c: {:.3f} loss_var: {:.3f} loss_match: {:.3f} loss_kp_pos: {:.3f} #matches_c: {:d}'.format(
+                        loss.item(), acc_coarse_0, acc_coarse, loss_coarse, loss_var, loss_match, loss_kp_pos, nb_coarse)
                 )
                 pbar.update(1)
 
@@ -315,7 +317,7 @@ class Stage1Trainer:
                 self.writer.add_scalar('Accuracy/coarse_mdepth', acc_coarse, i)
                 self.writer.add_scalar('Loss/coarse', loss_coarse, i)
                 self.writer.add_scalar('Loss/variance', loss_var, i)
-                self.writer.add_scalar('Loss/reliability', loss_l1, i)
+                self.writer.add_scalar('Loss/matchability', loss_match, i)
                 self.writer.add_scalar('Loss/keypoint_pos', loss_kp_pos, i)
                 self.writer.add_scalar('Count/matches_coarse', nb_coarse, i)
 
@@ -336,6 +338,7 @@ if __name__ == '__main__':
         save_ckpt_every=args.save_ckpt_every,
         stability_weight=args.stability_weight,
         variance_loss_weight=args.variance_loss_weight,
+        matchability_loss_weight=args.matchability_loss_weight,
         stability_eps=args.stability_eps,
     )
     trainer.train()

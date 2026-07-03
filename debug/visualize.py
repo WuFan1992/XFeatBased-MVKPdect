@@ -30,7 +30,7 @@ def run_test(image_path, top_k=200, device="cuda"):
     # ===== 3. 预处理并 forward =====
     with torch.no_grad():
         x, rh, rw = vudnet.preprocess_tensor(img_tensor)
-        feats, kpts, reliability, vars = vudnet.net(x)
+        feats, vars, match, kpts = vudnet.net(x)
         
         heatmap = vudnet.get_kpts_heatmap(kpts)
         
@@ -39,14 +39,14 @@ def run_test(image_path, top_k=200, device="cuda"):
     heatmap_vis = heatmap.squeeze().cpu().numpy()  # [H, W]
     heatmap_vis = cv2.resize(heatmap_vis, (W, H))
 
-    rel_vis = reliability.squeeze().cpu().numpy()  # [H/8, W/8]
-    rel_vis = cv2.resize(rel_vis, (W, H))
+    match_vis = match.squeeze().cpu().numpy()  # [H/8, W/8]
+    match_vis = cv2.resize(match_vis, (W, H))
     
     var_vis = vars.squeeze().cpu().numpy()
     var_vis = cv2.resize(var_vis, (W,H))
 
     print("heatmap range:", heatmap_vis.min(), heatmap_vis.max())
-    print("reliability range:", rel_vis.min(), rel_vis.max())
+    print("match range:", match_vis.min(), match_vis.max())
     print("variance range ", var_vis.min(), var_vis.max())
 
     # ===== 5. 显示 =====
@@ -64,8 +64,8 @@ def run_test(image_path, top_k=200, device="cuda"):
     plt.axis('off')
 
     plt.subplot(1, 4, 3)
-    plt.title("VUDNet Reliability")
-    plt.imshow(rel_vis, cmap='jet')
+    plt.title("VUDNet Matchability")
+    plt.imshow(match_vis, cmap='jet')
     plt.colorbar()
     plt.axis('off')
     
