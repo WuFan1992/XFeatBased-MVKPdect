@@ -319,7 +319,7 @@ class VUDNetModel(nn.Module):
 
         raw_variance = self.variance_head(feats)
         variance = torch.sigmoid(raw_variance)
-        matchability = torch.sigmoid(self.matchability_head(feats))
+        matchability = self.matchability_head(feats)
         keypoints = self.keypoint_head(self._unfold2d(x_gray, ws=8))
 
         return feats, variance, matchability, keypoints

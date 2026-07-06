@@ -214,12 +214,11 @@ def alike_distill_loss(kpts, img):
 
 
 def stability_aware_matchability_loss(pred, target, alpha=1.0, gamma=2.0, eps=1e-6):
-    """A stability-aware focal BCE loss for soft matchability targets.
+    """A focal BCE loss for matchability logits with soft or hard labels.
 
-    The target is a soft stability score in ``[0, 1]``. The loss uses a focal
-    modulation to emphasize hard or uncertain pixels and re-weights high-stability
-    samples more strongly, which is a different formulation from the standard
-    RDD-style focal loss on binary repeatability labels.
+    This keeps the RDD-style focal modulation, but the supervision target is
+    decoupled from stability and can be constructed from sparse positive/negative
+    matchability samples.
     """
     pred = pred.float().reshape(-1)
     target = target.float().reshape(-1).clamp(0.0, 1.0)
@@ -227,15 +226,11 @@ def stability_aware_matchability_loss(pred, target, alpha=1.0, gamma=2.0, eps=1e
     if pred.numel() == 0:
         return pred.new_zeros(())
 
-    p = torch.sigmoid(pred).clamp(eps, 1.0 - eps)
+    prob = torch.sigmoid(pred).clamp(eps, 1.0 - eps)
     bce = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
-
-    focal_modulation = torch.where(
-        target > 0.5,
-        torch.pow(1.0 - p + eps, gamma),
-        torch.pow(p + eps, gamma),
-    )
-    weights = 0.5 + alpha * target
+    pt = prob * target + (1.0 - prob) * (1.0 - target)
+    focal_modulation = torch.pow(1.0 - pt + eps, gamma)
+    weights = 1.0 + alpha * target
 
     return (weights * focal_modulation * bce).mean()
 

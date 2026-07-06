@@ -54,6 +54,35 @@ def _compute_relative_pose_diff(T_0to1, eps=1e-6):
     return pose_diff
 
 
+def _sample_negative_coords(h_feat, w_feat, positive_coords, num_samples, device):
+    if num_samples <= 0:
+        return None
+
+    total = h_feat * w_feat
+    all_indices = torch.arange(total, device=device)
+    if positive_coords.numel() > 0:
+        positive_indices = (positive_coords[:, 1].long() * w_feat + positive_coords[:, 0].long()).unique()
+        mask = torch.ones(total, dtype=torch.bool, device=device)
+        mask[positive_indices.clamp(min=0, max=total - 1)] = False
+        candidates = all_indices[mask]
+    else:
+        candidates = all_indices
+
+    if candidates.numel() == 0:
+        return None
+
+    if candidates.numel() >= num_samples:
+        perm = torch.randperm(candidates.numel(), device=device)[:num_samples]
+        chosen = candidates[perm]
+    else:
+        rand_idx = torch.randint(0, candidates.numel(), (num_samples,), device=device)
+        chosen = candidates[rand_idx]
+
+    neg_y = chosen // w_feat
+    neg_x = chosen % w_feat
+    return torch.stack([neg_x, neg_y], dim=-1)
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Stage-1 descriptor/stability/matchability training")
     parser.add_argument('--megadepth_root_path', type=str, required=True,
@@ -268,9 +297,33 @@ class Stage1Trainer:
                         stability_weight=self.stability_weight,
                     )
 
+                    neg_count = max(1, pts1.shape[0])
+                    neg_pts1 = _sample_negative_coords(h_feat, w_feat, pts1, neg_count, self.dev)
+                    neg_pts2 = _sample_negative_coords(h_feat, w_feat, pts2, neg_count, self.dev)
+
+                    match_logits = []
+                    match_targets = []
+
+                    match_logits.append(m1_match)
+                    match_targets.append(torch.ones_like(m1_match))
+                    match_logits.append(m2_match)
+                    match_targets.append(torch.ones_like(m2_match))
+
+                    if neg_pts1 is not None:
+                        neg_m1 = match1[b, 0, neg_pts1[:, 1].long(), neg_pts1[:, 0].long()].squeeze(-1)
+                        match_logits.append(neg_m1)
+                        match_targets.append(torch.zeros_like(neg_m1))
+
+                    if neg_pts2 is not None:
+                        neg_m2 = match2[b, 0, neg_pts2[:, 1].long(), neg_pts2[:, 0].long()].squeeze(-1)
+                        match_logits.append(neg_m2)
+                        match_targets.append(torch.zeros_like(neg_m2))
+
                     loss_match = (
-                        stability_aware_matchability_loss(m1_match, variance_target) +
-                        stability_aware_matchability_loss(m2_match, variance_target)
+                        stability_aware_matchability_loss(
+                            torch.cat(match_logits, dim=0),
+                            torch.cat(match_targets, dim=0),
+                        )
                     ) * 0.5
 
                     loss_kp_pos1, _ = alike_distill_loss(kpts1[b], p1[b])

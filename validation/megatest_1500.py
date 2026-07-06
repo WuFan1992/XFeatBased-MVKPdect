@@ -158,7 +158,6 @@ class MegaDepthPoseMNNBenchmark:
 
 
                     kpts0, kpts1, sigma0, sigma1 = model_helper.match(im_A_path, im_B_path)
-                    sigma0, sigma1 = None,  None
 
 
 

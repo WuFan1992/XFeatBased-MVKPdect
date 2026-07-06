@@ -14,7 +14,7 @@ class VUDNet(nn.Module):
         It supports inference for both sparse and semi-dense feature extraction & matching.
     """
 
-    def __init__(self, weights = os.path.abspath(os.path.dirname(__file__)) + '/../checkpoints/stage1/stage1_10000_stable+matchability.pth', top_k = 4096, detection_threshold=0.05):
+    def __init__(self, weights = os.path.abspath(os.path.dirname(__file__)) + '/../checkpoints/stage1/stage1_10000.pth', top_k = 4096, detection_threshold=0.05):
         super().__init__()
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         use_adapter = isinstance(weights, (list, tuple)) and len(weights) >= 2
@@ -90,13 +90,12 @@ class VUDNet(nn.Module):
         #Get variance
         variances = _bilinear(V1, mkpts, _H1, _W1).squeeze(-1)
         
-        #scores = (_nearest(K1h, mkpts, _H1, _W1) * _bilinear(M1, mkpts, _H1, _W1)).squeeze(-1)
-        scores = (_nearest(K1h, mkpts, _H1, _W1) * _bilinear(M1, mkpts, _H1, _W1) * _bilinear(V1, mkpts, _H1, _W1)).squeeze(-1)
-        # softly bias towards lower variance keypoints without destroying distribution
-        #sigma_min = variances.min(dim=-1, keepdim=True)[0]
-        #sigma_max = variances.max(dim=-1, keepdim=True)[0]
-        #sigma_norm = (variances - sigma_min) / (sigma_max - sigma_min + 1e-6)
-        #scores = scores * (1.0 - 0.12 * sigma_norm)
+        matchability = torch.sigmoid(_bilinear(M1, mkpts, _H1, _W1))
+        scores = (_nearest(K1h, mkpts, _H1, _W1) * matchability).squeeze(-1)
+
+        # Use variance as a post-hoc trim rather than a multiplicative factor.
+        variance_thresh = torch.quantile(variances.detach(), 0.90, dim=-1, keepdim=True)
+        scores = scores.masked_fill(variances > variance_thresh, -1)
         scores[torch.all(mkpts == 0, dim=-1)] = -1
 
         #Select top-k features
