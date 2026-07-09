@@ -8,69 +8,6 @@ from modules.training import utils
 from third_party.alike_wrapper import extract_alike_kpts
 
 
-def mv_infonce_masked(f_inv, visibility, tau=0.2):
-    """
-    Multi-View InfoNCE with intra-view negatives:
-    - cross-view positive: corresponding points in different views
-    - cross-view negative: non-corresponding points in different views  
-    - intra-view negative: other points in same view (prevents feature collapse)
-    
-    Args:
-        f_inv: [N, V, C] feature descriptors
-        visibility: [N, V] visibility mask (bool)
-        tau: temperature parameter
-    
-    Returns:
-        loss: scalar loss value
-    """
-    N, V, C = f_inv.shape
-    f = F.normalize(f_inv, dim=2)
-
-    loss = 0.0
-    count = 0
-
-    for i in range(V):
-        for j in range(i + 1, V):
-            mask = visibility[:, i] & visibility[:, j]
-            if mask.sum() < 10:
-                continue
-
-            fi = f[mask, i]   # [M, C]
-            fj = f[mask, j]   # [M, C]
-
-            M = fi.shape[0]
-
-            # ===== cross-view similarity =====
-            sim_cross = fi @ fj.t() / tau   # [M, M], 对角线为正样本
-
-            # ===== intra-view similarity =====
-            #sim_intra_i = fi @ fi.t() / tau
-            #sim_intra_j = fj @ fj.t() / tau
-
-            # ===== mask掉对角线（避免自己当negative）=====
-            #diag_mask = torch.eye(M, device=fi.device, dtype=torch.bool)
-            #sim_intra_i = sim_intra_i.masked_fill(diag_mask, float('-inf'))
-            #sim_intra_j = sim_intra_j.masked_fill(diag_mask, float('-inf'))
-
-            # ===== 拼接 logits =====
-            #logits_i = torch.cat([sim_cross, sim_intra_i], dim=1)  # [M, 2M]
-            #logits_j = torch.cat([sim_cross.t(), sim_intra_j], dim=1)
-            
-            logits_i = sim_cross
-            logits_j = sim_cross.t()
-
-            labels = torch.arange(M, device=fi.device)
-
-            loss_i = F.cross_entropy(logits_i, labels, reduction='mean')
-            loss_j = F.cross_entropy(logits_j, labels, reduction='mean')
-            
-            loss += loss_i + loss_j
-            count += 2
-
-    if count == 0:
-        return torch.tensor(0.0, device=f.device, requires_grad=True)
-
-    return loss / count
 
 
 def coordinate_classification_loss(coords, pts1, pts2, conf):
@@ -109,6 +46,58 @@ def weighted_pairwise_descriptor_loss(m1, m2, stability, temp=0.07, stability_we
     weights = 1.0 + stability_weight * stability
     loss = ((loss12 + loss21) * weights).mean()
     return loss
+
+
+def stability_weighted_hard_negative_descriptor_loss(
+    m1,
+    m2,
+    stability,
+    neg_m1=None,
+    neg_m2=None,
+    temp=0.07,
+    stability_weight=1.0,
+):
+    """A stronger descriptor loss that combines stability weighting and hard negatives.
+
+    Each positive pair is pushed to be more similar than sampled hard negatives from
+    the same image, while the stability signal weights the penalty for each point.
+    """
+    if m1.dim() != 2 or m2.dim() != 2:
+        raise RuntimeError('m1 and m2 must be 2D tensors')
+
+    m1 = F.normalize(m1, dim=-1)
+    m2 = F.normalize(m2, dim=-1)
+
+    if neg_m1 is None or neg_m2 is None or neg_m1.numel() == 0 or neg_m2.numel() == 0:
+        return weighted_pairwise_descriptor_loss(m1, m2, stability, temp=temp, stability_weight=stability_weight)
+
+    neg_m1 = F.normalize(neg_m1, dim=-1)
+    neg_m2 = F.normalize(neg_m2, dim=-1)
+
+    if neg_m1.dim() == 2:
+        neg_m1 = neg_m1.unsqueeze(1)
+    if neg_m2.dim() == 2:
+        neg_m2 = neg_m2.unsqueeze(1)
+
+    stability = stability.to(m1.device).float().clamp(0.0, 1.0).reshape(-1)
+    if stability.numel() != m1.size(0):
+        stability = torch.ones(m1.size(0), device=m1.device, dtype=m1.dtype)
+
+    weights = 1.0 + stability_weight * stability
+
+    pos_sim_12 = (m1 * m2).sum(dim=-1) / temp
+    neg_sim_12 = torch.einsum('mc,mkc->mk', m1, neg_m2) / temp
+    logits_12 = torch.cat([pos_sim_12.unsqueeze(1), neg_sim_12], dim=1)
+    targets_12 = torch.zeros(logits_12.size(0), dtype=torch.long, device=logits_12.device)
+    loss12 = F.cross_entropy(logits_12, targets_12)
+
+    pos_sim_21 = (m2 * m1).sum(dim=-1) / temp
+    neg_sim_21 = torch.einsum('mc,mkc->mk', m2, neg_m1) / temp
+    logits_21 = torch.cat([pos_sim_21.unsqueeze(1), neg_sim_21], dim=1)
+    targets_21 = torch.zeros(logits_21.size(0), dtype=torch.long, device=logits_21.device)
+    loss21 = F.cross_entropy(logits_21, targets_21)
+
+    return ((loss12 + loss21) * weights).mean()
 
 
 def dual_softmax_loss(X, Y, temp = 0.2, hard_neg_X=None, hard_neg_Y=None, hard_neg_weight=0.3, margin=0.1):

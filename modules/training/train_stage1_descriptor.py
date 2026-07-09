@@ -83,6 +83,64 @@ def _sample_negative_coords(h_feat, w_feat, positive_coords, num_samples, device
     return torch.stack([neg_x, neg_y], dim=-1)
 
 
+def _sample_hard_negative_descriptors(feature_map, positive_descs, positive_coords, h_feat, w_feat, num_samples, device):
+    """Batch hard-negative mining from a single feature map.
+
+    Instead of looping over each positive point and scanning the whole map, we sample a
+    compact candidate pool from the feature map and select the hardest negatives for all
+    positives in one batched operation.
+    """
+    if feature_map is None or positive_descs is None:
+        return None
+
+    feature_map = feature_map.to(device)
+    if positive_descs.dim() == 1:
+        positive_descs = positive_descs.unsqueeze(0)
+    if positive_coords is not None and positive_coords.dim() == 1:
+        positive_coords = positive_coords.unsqueeze(0)
+
+    positive_descs = positive_descs.to(device)
+    positive_descs = F.normalize(positive_descs, dim=-1)
+
+    feat_flat = feature_map.permute(1, 2, 0).reshape(-1, feature_map.size(0))
+    feat_flat = F.normalize(feat_flat, dim=-1)
+
+    num_points = positive_descs.size(0)
+    if num_points == 0:
+        return None
+
+    total_positions = feat_flat.size(0)
+    candidate_pool_size = min(max(256, 16 * max(1, num_samples)), total_positions)
+    if total_positions <= candidate_pool_size:
+        candidate_idx = torch.arange(total_positions, device=device)
+    else:
+        candidate_idx = torch.randperm(total_positions, device=device)[:candidate_pool_size]
+
+    candidate_feats = feat_flat[candidate_idx]
+    scores = candidate_feats @ positive_descs.t()
+    scores = scores.t()  # [num_points, candidate_pool_size]
+
+    if positive_coords is not None and positive_coords.numel() > 0:
+        positive_coords = positive_coords.to(device).long()
+        for i in range(num_points):
+            pos_y = int(positive_coords[i, 1].item())
+            pos_x = int(positive_coords[i, 0].item())
+            if 0 <= pos_y < h_feat and 0 <= pos_x < w_feat:
+                pos_idx = pos_y * w_feat + pos_x
+                if 0 <= pos_idx < total_positions:
+                    candidate_pos_mask = candidate_idx == pos_idx
+                    if candidate_pos_mask.any():
+                        scores[i, candidate_pos_mask] = -1e9
+
+    if scores.size(1) == 0:
+        return None
+
+    k = min(max(1, num_samples), scores.size(1))
+    _, topk_idx = torch.topk(scores, k=k, dim=1)
+    neg_feats = candidate_feats[topk_idx]  # [num_points, k, C]
+    return neg_feats
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Stage-1 descriptor/stability/matchability training")
     parser.add_argument('--megadepth_root_path', type=str, required=True,
@@ -289,17 +347,36 @@ class Stage1Trainer:
                     loss_var = F.mse_loss(variance_pred, variance_target)
 
                     stability_weight = variance_target
-                    loss_ds = weighted_pairwise_descriptor_loss(
+
+                    neg_count = max(4, min(8, pts1.shape[0]))
+                    neg_m1 = _sample_hard_negative_descriptors(
+                        feats1[b],
+                        m1,
+                        pts1,
+                        h_feat,
+                        w_feat,
+                        num_samples=neg_count,
+                        device=self.dev,
+                    )
+                    neg_m2 = _sample_hard_negative_descriptors(
+                        feats2[b],
+                        m2,
+                        pts2,
+                        h_feat,
+                        w_feat,
+                        num_samples=neg_count,
+                        device=self.dev,
+                    )
+
+                    loss_ds = stability_weighted_hard_negative_descriptor_loss(
                         m1,
                         m2,
                         stability=stability_weight,
+                        neg_m1=neg_m1,
+                        neg_m2=neg_m2,
                         temp=0.07,
                         stability_weight=self.stability_weight,
                     )
-
-                    neg_count = max(1, pts1.shape[0])
-                    neg_pts1 = _sample_negative_coords(h_feat, w_feat, pts1, neg_count, self.dev)
-                    neg_pts2 = _sample_negative_coords(h_feat, w_feat, pts2, neg_count, self.dev)
 
                     match_logits = []
                     match_targets = []
@@ -309,15 +386,17 @@ class Stage1Trainer:
                     match_logits.append(m2_match)
                     match_targets.append(torch.ones_like(m2_match))
 
+                    neg_pts1 = _sample_negative_coords(h_feat, w_feat, pts1, neg_count, self.dev)
+                    neg_pts2 = _sample_negative_coords(h_feat, w_feat, pts2, neg_count, self.dev)
                     if neg_pts1 is not None:
-                        neg_m1 = match1[b, 0, neg_pts1[:, 1].long(), neg_pts1[:, 0].long()].squeeze(-1)
-                        match_logits.append(neg_m1)
-                        match_targets.append(torch.zeros_like(neg_m1))
+                        neg_m1_match = match1[b, 0, neg_pts1[:, 1].long(), neg_pts1[:, 0].long()].squeeze(-1)
+                        match_logits.append(neg_m1_match)
+                        match_targets.append(torch.zeros_like(neg_m1_match))
 
                     if neg_pts2 is not None:
-                        neg_m2 = match2[b, 0, neg_pts2[:, 1].long(), neg_pts2[:, 0].long()].squeeze(-1)
-                        match_logits.append(neg_m2)
-                        match_targets.append(torch.zeros_like(neg_m2))
+                        neg_m2_match = match2[b, 0, neg_pts2[:, 1].long(), neg_pts2[:, 0].long()].squeeze(-1)
+                        match_logits.append(neg_m2_match)
+                        match_targets.append(torch.zeros_like(neg_m2_match))
 
                     loss_match = (
                         stability_aware_matchability_loss(
