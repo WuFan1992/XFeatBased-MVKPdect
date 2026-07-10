@@ -189,17 +189,6 @@ class VUDNetModel(nn.Module):
         )
 
         ########################################
-        # Keypoint Head
-        ########################################
-
-        self.keypoint_head = nn.Sequential(
-            BasicLayer(64, 64, 1, padding=0),
-            BasicLayer(64, 64, 1, padding=0),
-            BasicLayer(64, 64, 1, padding=0),
-            nn.Conv2d(64, 65, 1),
-        )
-
-        ########################################
         # Matchability Head
         ########################################
 
@@ -216,6 +205,16 @@ class VUDNetModel(nn.Module):
             BasicLayer(64, 64, 3, padding=1),
             BasicLayer(64, 32, 3, padding=1),
             nn.Conv2d(32, 1, 1), 
+        )
+
+        ########################################
+        # Detector Head (RDD-style)
+        ########################################
+        self.detector_head = nn.Sequential(
+            BasicLayer(64, 64, 1, padding=0),
+            BasicLayer(64, 64, 1, padding=0),
+            BasicLayer(64, 64, 1, padding=0),
+            nn.Conv2d(64, 1, 1),
         )
 
     def _unfold2d(self, x, ws=8):
@@ -320,14 +319,19 @@ class VUDNetModel(nn.Module):
         raw_variance = self.variance_head(feats)
         variance = torch.sigmoid(raw_variance)
         matchability = self.matchability_head(feats)
-        keypoints = self.keypoint_head(self._unfold2d(x_gray, ws=8))
+        detector_map = torch.sigmoid(self.detector_head(feats))
 
-        return feats, variance, matchability, keypoints
+        return feats, variance, matchability, detector_map
 
-    def forward(self, x):
-        feats, variance, matchability, kpts = self._forward_impl(x)
-        return feats, variance, matchability, kpts
+    def forward(self, x, return_detector=False):
+        feats, variance, matchability, detector_map = self._forward_impl(x)
+        if return_detector:
+            return feats, variance, matchability, detector_map
+        return feats, variance, matchability, detector_map
 
-    def forward_with_aux(self, x):
-        return self._forward_impl(x)
+    def forward_with_aux(self, x, return_detector=False):
+        feats, variance, matchability, detector_map = self._forward_impl(x)
+        if return_detector:
+            return feats, variance, matchability, detector_map
+        return feats, variance, matchability, detector_map
     
