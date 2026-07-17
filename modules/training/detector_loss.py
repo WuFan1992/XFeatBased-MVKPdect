@@ -260,7 +260,7 @@ class PeakyLoss(object):
             loss_peaky = pred['score_dispersity'][idx][valid]
             loss_mean += loss_peaky.sum()
             CNT += len(loss_peaky)
-        return loss_mean / CNT if CNT != 0 else pred['scores_map'].new_tensor(0)
+        return loss_mean / CNT if CNT != 0 else pred['scores_map'].sum() * 0.0
 
 class ReprojectionLocLoss(object):
     def __init__(self, norm: int = 1, scores_th: float = 0.1):
@@ -292,7 +292,7 @@ class ReprojectionLocLoss(object):
             reprojection_errors = dist[ids0_d, ids1_d][valid]
             loss_mean += reprojection_errors.sum()
             CNT += len(reprojection_errors)
-        return loss_mean / CNT if CNT != 0 else pred0['scores_map'].new_tensor(0)
+        return loss_mean / CNT if CNT != 0 else pred0['scores_map'].sum() * 0.0
 
 class ScoreMapRepLoss(object):
     def __init__(self, temperature: float = 0.1):
@@ -374,7 +374,7 @@ class ScoreMapRepLoss(object):
             if (idx + 1) % 2 == 0:
                 torch.cuda.empty_cache()
 
-        return loss_mean / CNT if CNT != 0 else pred0['scores_map'].new_tensor(0)
+        return loss_mean / CNT if CNT != 0 else pred0['scores_map'].sum() * 0.0
 
 def compute_keypoints_distance(kpts0, kpts1, p=2, debug=False):
     """

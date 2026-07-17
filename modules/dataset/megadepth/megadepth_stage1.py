@@ -41,7 +41,7 @@ class MegaDepthStage1Dataset(Dataset):
         self.img_resize = img_resize
         self.df = df
         self.img_padding = img_padding
-        self.depth_max_size = 2000 if depth_padding else None
+        self.depth_max_size = None
 
         for idx in range(len(self.scene_info['image_paths'])):
             self.scene_info['image_paths'][idx] = fix_path_from_d2net(self.scene_info['image_paths'][idx])

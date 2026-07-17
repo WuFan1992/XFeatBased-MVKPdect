@@ -20,7 +20,13 @@ def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1):
         calculable_mask (torch.Tensor): [N, L]
         warped_keypoints0 (torch.Tensor): [N, L, 2] <x0_hat, y1_hat>
     """
-    kpts0_long = kpts0.round().long().clip(0, 2000-1)
+    h0, w0 = depth0.shape[-2:]
+    kpts0_long = kpts0.round().long()
+    valid_x = (kpts0_long[..., 0] >= 0) & (kpts0_long[..., 0] < w0)
+    valid_y = (kpts0_long[..., 1] >= 0) & (kpts0_long[..., 1] < h0)
+    in_bounds = valid_x & valid_y
+    kpts0_long[..., 0] = kpts0_long[..., 0].clamp(0, w0 - 1)
+    kpts0_long[..., 1] = kpts0_long[..., 1].clamp(0, h0 - 1)
 
     # 边界深度清0
     depth0[:, 0, :] = 0 ; depth1[:, 0, :] = 0 
@@ -30,7 +36,7 @@ def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1):
     kpts0_depth = torch.stack(
         [depth0[i, kpts0_long[i, :, 1], kpts0_long[i, :, 0]] for i in range(kpts0.shape[0])], dim=0
     )  # (N, L)
-    nonzero_mask = kpts0_depth > 0
+    nonzero_mask = (kpts0_depth > 0) & in_bounds
 
     # Draw cross marks on the image for each keypoint
     # for b in range(len(kpts0)):
@@ -198,14 +204,37 @@ def spvs_coarse(data, scale = 8):
             # 如果有多个3D 点同时映射到同一个像素位置，自动覆盖从而实现去重的目的
             # 这里进行了两次去重，一次是src to tgt ，避免one to many 
             # 第二次是去重是tgt to src 避免many to one
-            lut_mat12[src_pts[:,1].long(), src_pts[:,0].long()] = torch.cat([src_pts, tgt_pts], dim=1)  
+            src_x = src_pts[:, 0].long()
+            src_y = src_pts[:, 1].long()
+            valid_src = (src_x >= 0) & (src_x < w1) & (src_y >= 0) & (src_y < h1)
+            src_x = src_x[valid_src]
+            src_y = src_y[valid_src]
+            src_pts_valid = src_pts[valid_src]
+            tgt_pts_valid = tgt_pts[valid_src]
+
+            if src_pts_valid.numel() == 0:
+                corrs.append(torch.empty((0, 4), device=device, dtype=torch.float32))
+                continue
+
+            lut_mat12[src_y, src_x] = torch.cat([src_pts_valid, tgt_pts_valid], dim=1)
             # 例如有A: (10,20) → (30,40) B: (10,20) → (35,45) 第二次赋值会：覆盖第一次 最终的结果是，一个source 像素只会保留一个匹配
             mask_valid12 = torch.all(lut_mat12 >= 0, dim=-1)
             points = lut_mat12[mask_valid12]
 
             #Target-src check 
             src_pts, tgt_pts = points[:, :2], points[:, 2:]
-            lut_mat21[tgt_pts[:,1].long(), tgt_pts[:,0].long()] = torch.cat([src_pts, tgt_pts], dim=1)
+            tgt_x = tgt_pts[:, 0].long()
+            tgt_y = tgt_pts[:, 1].long()
+            valid_tgt = (tgt_x >= 0) & (tgt_x < w1) & (tgt_y >= 0) & (tgt_y < h1)
+            tgt_x = tgt_x[valid_tgt]
+            tgt_y = tgt_y[valid_tgt]
+            src_pts = src_pts[valid_tgt]
+            tgt_pts = tgt_pts[valid_tgt]
+            if src_pts.numel() == 0:
+                corrs.append(torch.empty((0, 4), device=device, dtype=torch.float32))
+                continue
+
+            lut_mat21[tgt_y, tgt_x] = torch.cat([src_pts, tgt_pts], dim=1)
             # 例如有A: (10,20) → (30,40) B: (11,20) → (30,40) 第二次赋值会：覆盖第一次 最终的结果是，一个source 像素只会保留一个匹配
             mask_valid21 = torch.all(lut_mat21 >= 0, dim=-1)
             points = lut_mat21[mask_valid21]

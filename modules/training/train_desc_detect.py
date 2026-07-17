@@ -271,6 +271,11 @@ class Trainer:
                 if loss is None:
                     continue
 
+                if not loss.requires_grad:
+                    # Skip rare invalid batches where loss has no autograd path.
+                    self.opt.zero_grad(set_to_none=True)
+                    continue
+
                 # Scale loss for gradient accumulation
                 loss = loss / self.grad_accumulation_steps
 
