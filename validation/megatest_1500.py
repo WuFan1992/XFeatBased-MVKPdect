@@ -122,7 +122,7 @@ class MegaDepthPoseMNNBenchmark:
         ]
         self.data_root = data_root
 
-    def benchmark(self, model_helper, model_name = None, scale_intrinsics = False, calibrated = True, plot_every_iter=1, plot=False, method='sparse'):
+    def benchmark(self, model_helper, model_name = None, scale_intrinsics = False, calibrated = True, plot_every_iter=1, plot=False, method='sparse', top_k=4096):
         
         with torch.no_grad():
             data_root = self.data_root
@@ -157,7 +157,7 @@ class MegaDepthPoseMNNBenchmark:
                                         
 
 
-                    kpts0, kpts1, sigma0, sigma1 = model_helper.match(im_A_path, im_B_path)
+                    kpts0, kpts1, sigma0, sigma1 = model_helper.match(im_A_path, im_B_path, top_k=top_k)
 
 
 
@@ -176,7 +176,8 @@ class MegaDepthPoseMNNBenchmark:
                     
                         
                     threshold = 0.5 
-                    if calibrated:
+                    ret = None
+                    if calibrated and len(kpts0) > 0 and len(kpts1) > 0:
                         norm_threshold = threshold / (np.mean(np.abs(K0[:2, :2])) + np.mean(np.abs(K1[:2, :2])))
                         ret = estimate_pose(
                             kpts0,
@@ -202,10 +203,9 @@ class MegaDepthPoseMNNBenchmark:
                         
                         
                         
-                        if scene_ind % plot_every_iter == 0 and plot:
+                        if pairind % plot_every_iter == 0 and plot:
 
-                            if not os.path.exists(f'outputs/mega_1500/{model_name}_{method}'):
-                                os.mkdir(f'outputs/mega_1500/{model_name}_{method}')
+                            os.makedirs(f'outputs/mega_1500/{model_name}_{method}', exist_ok=True)
                             name = f'outputs/mega_1500/{model_name}_{method}/{scene_name}_{pairind}.png'
                             _make_evaluation_figure(im_A, im_B, kpts0, kpts1, epi_errs, e_t, e_R, path=name)
                         e_pose = max(e_t, e_R)
@@ -274,6 +274,6 @@ if __name__ == "__main__":
     
     with torch.no_grad():
         method = args.method
-        out = benchmark.benchmark(model_helper, model_name='VUDNet', plot_every_iter=1, plot=args.plot, method=method)
+        out = benchmark.benchmark(model_helper, model_name='VUDNet', plot_every_iter=1, plot=args.plot, method=method, top_k=4096)
         with open(f'outputs/mega_1500/VUDNet_{method}.txt', 'w') as f:
             f.write(str(out))

@@ -27,6 +27,10 @@ python -m modules.training.train_desc_detect --megadepth_root_path datasets --ck
 For training the detector stage, run the following command:
 add --train_detector --weights <descriptor_checkpoint>
 
+python -m modules.training.train_desc_detect   --megadepth_root_path datasets   --ckpt_save_path checkpoints/stage1   --batch_size 1   
+--n_steps 10000     --use_mixed_precision --train_detector --weights checkpoints/stage1/vudnet_stage1_descriptor_10000.pth 
+--detector_chunk_size 64 --detector_top_k 1024 
+
 """
 
 def parse_arguments():

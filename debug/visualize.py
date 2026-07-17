@@ -1,5 +1,6 @@
 import torch
 import cv2
+import numpy as np
 import matplotlib.pyplot as plt
 from modules.vudnet import VUDNet
 
@@ -12,6 +13,65 @@ def load_image(image_path, device):
     img_tensor = torch.from_numpy(img).float() / 255.0
     img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0).to(device)
     return img_tensor, img
+
+
+def detector_map_to_heatmap(vudnet, kpts):
+    """Convert detector outputs to a displayable heatmap.
+
+    The current model may return either:
+    - a single-channel detector map [B, 1, H, W]
+    - coarse logits with >= 64 channels, which need VUDNet.get_kpts_heatmap
+    """
+    if not isinstance(kpts, torch.Tensor):
+        raise TypeError(f"Expected torch.Tensor for detector output, got {type(kpts)}")
+
+    if kpts.dim() != 4:
+        raise ValueError(f"Expected detector output with shape [B, C, H, W], got {tuple(kpts.shape)}")
+
+    if kpts.shape[1] == 1:
+        heatmap = torch.sigmoid(kpts)
+    else:
+        heatmap = vudnet.get_kpts_heatmap(kpts)
+
+    return heatmap
+
+
+def tensor_to_resized_map(tensor_map, out_hw, use_sigmoid=False):
+    if tensor_map.dim() == 4:
+        tensor_map = tensor_map[0, 0]
+    elif tensor_map.dim() == 3:
+        tensor_map = tensor_map[0]
+
+    if use_sigmoid:
+        tensor_map = torch.sigmoid(tensor_map)
+
+    array = tensor_map.detach().cpu().float().numpy()
+    array = cv2.resize(array, (out_hw[1], out_hw[0]))
+    return array
+
+
+def normalize_map(array):
+    array = array.astype(np.float32)
+    min_val = float(array.min())
+    max_val = float(array.max())
+    if max_val - min_val < 1e-8:
+        return np.zeros_like(array)
+    return (array - min_val) / (max_val - min_val)
+
+
+def keypoints_overlay(img, keypoints, max_points=200):
+    overlay = img.copy()
+    if keypoints is None or len(keypoints) == 0:
+        return overlay
+
+    keypoints = np.asarray(keypoints)
+    if keypoints.shape[0] > max_points:
+        keypoints = keypoints[:max_points]
+
+    for x, y in keypoints:
+        cv2.circle(overlay, (int(round(x)), int(round(y))), 2, (255, 80, 80), -1)
+
+    return overlay
 
 
 def run_test(image_path, top_k=200, device="cuda"):
@@ -31,48 +91,51 @@ def run_test(image_path, top_k=200, device="cuda"):
     with torch.no_grad():
         x, rh, rw = vudnet.preprocess_tensor(img_tensor)
         feats, vars, match, kpts = vudnet.net(x)
-        
-        heatmap = vudnet.get_kpts_heatmap(kpts)
+        sparse = vudnet.detectAndCompute(img_tensor, top_k=top_k)[0]
+        print("feats shape:", feats.shape)
+        print("vars shape:", vars.shape)
+        print("match shape:", match.shape)
+        print("kpts shape:", kpts.shape)
+
+        heatmap = detector_map_to_heatmap(vudnet, kpts)
         
 
     # ===== 4. 准备可视化 =====
-    heatmap_vis = heatmap.squeeze().cpu().numpy()  # [H, W]
-    heatmap_vis = cv2.resize(heatmap_vis, (W, H))
+    heatmap_vis = normalize_map(heatmap.squeeze().cpu().numpy())
+    match_vis = normalize_map(tensor_to_resized_map(match, (H, W), use_sigmoid=True))
+    var_vis = normalize_map(tensor_to_resized_map(vars, (H, W), use_sigmoid=False))
+    kp_overlay = keypoints_overlay(img, sparse['keypoints'].cpu().numpy(), max_points=top_k)
 
-    match_vis = match.squeeze().cpu().numpy()  # [H/8, W/8]
-    match_vis = cv2.resize(match_vis, (W, H))
-    
-    var_vis = vars.squeeze().cpu().numpy()
-    var_vis = cv2.resize(var_vis, (W,H))
-
-    print("heatmap range:", heatmap_vis.min(), heatmap_vis.max())
-    print("match range:", match_vis.min(), match_vis.max())
-    print("variance range ", var_vis.min(), var_vis.max())
+    print("heatmap range:", float(heatmap_vis.min()), float(heatmap_vis.max()))
+    print("match range:", float(match_vis.min()), float(match_vis.max()))
+    print("variance range:", float(var_vis.min()), float(var_vis.max()))
+    print("keypoints:", len(sparse['keypoints']))
 
     # ===== 5. 显示 =====
-    plt.figure(figsize=(20, 5))
+    fig, axes = plt.subplots(1, 5, figsize=(26, 5))
 
-    plt.subplot(1, 4, 1)
-    plt.title("Original")
-    plt.imshow(img)
-    plt.axis('off')
+    axes[0].set_title("Original")
+    axes[0].imshow(img)
+    axes[0].axis('off')
 
-    plt.subplot(1, 4, 2)
-    plt.title("VUDNet Heatmap")
-    plt.imshow(heatmap_vis, cmap='hot')
-    plt.colorbar()
-    plt.axis('off')
+    axes[1].set_title("Detector Heatmap")
+    im1 = axes[1].imshow(heatmap_vis, cmap='hot')
+    fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+    axes[1].axis('off')
 
-    plt.subplot(1, 4, 3)
-    plt.title("VUDNet Matchability")
-    plt.imshow(match_vis, cmap='jet')
-    plt.colorbar()
-    plt.axis('off')
-    
-    plt.subplot(1,4,4)
-    plt.title("Variance")
-    plt.imshow(var_vis, cmap='jet')
-    plt.colorbar()
+    axes[2].set_title("Matchability")
+    im2 = axes[2].imshow(match_vis, cmap='jet')
+    fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+    axes[2].axis('off')
+
+    axes[3].set_title("Variance")
+    im3 = axes[3].imshow(var_vis, cmap='viridis')
+    fig.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.04)
+    axes[3].axis('off')
+
+    axes[4].set_title(f"Top-{min(top_k, len(sparse['keypoints']))} Keypoints")
+    axes[4].imshow(kp_overlay)
+    axes[4].axis('off')
 
     plt.tight_layout()
     plt.show()

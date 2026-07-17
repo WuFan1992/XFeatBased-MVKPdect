@@ -59,7 +59,7 @@ class VUDNet_helper(nn.Module):
         img2 = self.load_image(img2_path)
 
         # 👉 VUDNet 通常自带 detect + describe + match
-        kpts0, kpts1, sigma0, sigma1 = self.model.match_vudnet(img1, img2)
+        kpts0, kpts1, sigma0, sigma1 = self.model.match_vudnet(img1, img2, top_k=top_k)
        
         # ✅ 和你原接口对齐
         if len(kpts0) == 0:
