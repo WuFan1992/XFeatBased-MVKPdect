@@ -14,7 +14,7 @@ class VUDNet(nn.Module):
         It supports inference for both sparse and semi-dense feature extraction & matching.
     """
 
-    def __init__(self, weights = os.path.abspath(os.path.dirname(__file__)) + '/../checkpoints/stage1/stage1_10000_negative.pth', top_k = 4096, detection_threshold=0.05):
+    def __init__(self, weights = os.path.abspath(os.path.dirname(__file__)) + '/../checkpoints/stage1/vudnet_stage1_detector_10000.pth', top_k = 4096, detection_threshold=0.05):
         super().__init__()
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         use_adapter = isinstance(weights, (list, tuple)) and len(weights) >= 2
@@ -68,7 +68,7 @@ class VUDNet(nn.Module):
                 List[Dict]: 
                     'keypoints'    ->   torch.Tensor(N, 2): keypoints (x,y)
                     'scores'       ->   torch.Tensor(N,): keypoint scores
-                    'descriptors'  ->   torch.Tensor(N, 64): local features
+                    'descriptors'  ->   torch.Tensor(N, 256): local features
         """
         if top_k is None: top_k = self.top_k
         if detection_threshold is None: detection_threshold = self.detection_threshold
@@ -79,9 +79,8 @@ class VUDNet(nn.Module):
         F1, V1, M1, K1 = self.net(x)
         F1 = F.normalize(F1, dim=1)
 
-        #Convert logits to heatmap and extract kpts
-        K1h = self.get_kpts_heatmap(K1)
-        mkpts = self.NMS(K1h, threshold=detection_threshold, kernel_size=5)
+        # Extract keypoints directly from the full-resolution detector map.
+        mkpts = self.NMS(K1, threshold=detection_threshold, kernel_size=5)
 
         #Compute reliability scores
         _nearest = InterpolateSparse2d('nearest')
@@ -91,7 +90,7 @@ class VUDNet(nn.Module):
         variances = _bilinear(V1, mkpts, _H1, _W1).squeeze(-1)
         
         matchability = torch.sigmoid(_bilinear(M1, mkpts, _H1, _W1))
-        scores = (_nearest(K1h, mkpts, _H1, _W1) * matchability).squeeze(-1)
+        scores = (_nearest(K1, mkpts, _H1, _W1) * matchability).squeeze(-1)
 
         # Use variance as a post-hoc trim rather than a multiplicative factor.
         #variance_thresh = torch.quantile(variances.detach(), 0.90, dim=-1, keepdim=True)

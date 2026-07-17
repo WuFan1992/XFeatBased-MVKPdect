@@ -264,7 +264,7 @@ class Stage1Trainer:
                             d[k] = d[k].to(self.dev)
 
                     p1, p2 = d['image0'], d['image1']
-                    positives_md_coarse = megadepth_warper.spvs_coarse(d, 8)
+                    positives_md_coarse = megadepth_warper.spvs_coarse(d, 4)
 
                 if self.augmentor is not None:
                     h_coarse, w_coarse = p1s[0].shape[-2] // 8, p1s[0].shape[-1] // 8
@@ -399,7 +399,7 @@ class Stage1Trainer:
                         match_targets.append(torch.zeros_like(neg_m2_match))
 
                     loss_match = (
-                        stability_aware_matchability_loss(
+                        matchability_loss(
                             torch.cat(match_logits, dim=0),
                             torch.cat(match_targets, dim=0),
                         )

@@ -202,7 +202,7 @@ def alike_distill_loss(kpts, img):
 
 
 
-def stability_aware_matchability_loss(pred, target, alpha=1.0, gamma=2.0, eps=1e-6):
+def matchability_loss(pred, target, alpha=1.0, gamma=2.0, eps=1e-6):
     """A focal BCE loss for matchability logits with soft or hard labels.
 
     This keeps the RDD-style focal modulation, but the supervision target is

@@ -16,7 +16,7 @@ from modules.dataset.megadepth.megadepth_stage1 import MegaDepthStage1Dataset
 from modules.dataset.megadepth.megadepth_warper import *
 from modules.training.descriptor_loss import DescriptorStageLoss
 from modules.training.detector_loss import DetectorLoss, compute_correspondence
-from modules.training.rdd.models.soft_detect import SoftDetect
+from modules.training.vudnet_soft_detect import SoftDetect
 from modules.training.utils import *
 
 
@@ -69,8 +69,16 @@ def parse_arguments():
                         help='Top k keypoints to extract in detector training.')
     parser.add_argument('--detector_scores_th', type=float, default=0.1,
                         help='SoftDetect score threshold for detector training.')
+    parser.add_argument('--detector_chunk_size', type=int, default=64,
+                        help='Chunk size for processing keypoints in similarity map computation.')
+    parser.add_argument('--sim_map_downsample', type=int, default=4,
+                        help='Downsample factor for descriptor similarity maps in detector supervision.')
     parser.add_argument('--weights', type=str, default=None,
                         help='Path to a checkpoint to load before training.')
+    parser.add_argument('--use_mixed_precision', action='store_true',
+                        help='Use mixed precision (fp16) training to reduce memory usage.')
+    parser.add_argument('--grad_accumulation_steps', type=int, default=1,
+                        help='Gradient accumulation steps to simulate larger batch size.')
     return parser.parse_args()
 
 
@@ -87,8 +95,15 @@ class Trainer:
         self.args = args
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.train_detector = args.train_detector
+        self.use_amp = args.use_mixed_precision
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        self.grad_accumulation_steps = args.grad_accumulation_steps
 
-        self.net = VUDNetModel(pretrained=True, use_desc_adapter=False).to(self.dev)
+        self.net = VUDNetModel(
+            pretrained=True,
+            use_desc_adapter=False,
+            train_detector=self.train_detector,
+        ).to(self.dev)
         if args.weights is not None:
             self._load_weights(args.weights)
 
@@ -172,7 +187,7 @@ class Trainer:
                 batch[key] = value.to(self.dev)
 
         p1, p2 = batch['image0'], batch['image1']
-        positives_md_coarse = spvs_coarse(batch, 8)
+        positives_md_coarse = spvs_coarse(batch, 4)
         if any(len(x) < 30 for x in positives_md_coarse):
             return None, None
 
@@ -202,19 +217,36 @@ class Trainer:
             'scores_map': scores_map2,
         }
 
-        correspondences, pred0_with_rand, pred1_with_rand = compute_correspondence(
-            self.net,
-            pred0,
-            pred1,
-            batch,
-            softdetect=self.softdetect,
-            debug=False
-        )
+        # Clean up intermediate activations to save memory
+        del feats1, feats2, var1, var2, match1, match2, p1, p2
+        torch.cuda.empty_cache()
+
+        # Compute correspondences without grad tracking (we don't need gradients for these)
+        with torch.no_grad():
+            correspondences, pred0_with_rand, pred1_with_rand = compute_correspondence(
+                self.net,
+                pred0,
+                pred1,
+                batch,
+                softdetect=self.softdetect,
+                debug=False,
+                chunk_size=self.args.detector_chunk_size,
+                sim_map_downsample=self.args.sim_map_downsample,
+            )
+        
+        torch.cuda.empty_cache()
+        
         loss = self.detector_loss(correspondences, pred0_with_rand, pred1_with_rand)
+
+        # Clean up to prevent memory accumulation
+        del correspondences, pred0_with_rand, pred1_with_rand, pred0, pred1, batch
+        torch.cuda.empty_cache()
+
         metrics = {'loss': loss.item(), 'acc_coarse': 0.0, 'acc_kp': 0.0, 'nb_coarse': 0}
         return loss, metrics
 
     def train(self):
+        import gc
         with tqdm(total=self.steps) as pbar:
             for i in range(self.steps):
                 if self.dry_run and i > 10:
@@ -223,30 +255,51 @@ class Trainer:
                 if batch is None:
                     break
 
-                if self.train_detector:
-                    loss, metrics = self._detector_step(batch)
+                # Mixed precision context
+                if self.use_amp:
+                    with torch.amp.autocast('cuda'):
+                        if self.train_detector:
+                            loss, metrics = self._detector_step(batch)
+                        else:
+                            loss, metrics = self._descriptor_step(batch)
                 else:
-                    loss, metrics = self._descriptor_step(batch)
+                    if self.train_detector:
+                        loss, metrics = self._detector_step(batch)
+                    else:
+                        loss, metrics = self._descriptor_step(batch)
 
                 if loss is None:
                     continue
 
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
-                self.opt.step()
-                self.opt.zero_grad()
-                self.scheduler.step()
+                # Scale loss for gradient accumulation
+                loss = loss / self.grad_accumulation_steps
+
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+                # Gradient accumulation step
+                if (i + 1) % self.grad_accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
+                    if self.use_amp:
+                        self.scaler.step(self.opt)
+                        self.scaler.update()
+                    else:
+                        self.opt.step()
+                    self.opt.zero_grad()
+                    self.scheduler.step()
 
                 if (i + 1) % self.save_ckpt_every == 0:
                     print('saving iter ', i + 1)
                     self._save_checkpoint(i + 1)
 
                 pbar.set_description(
-                    f"Step {i+1}/{self.steps} loss {loss.item():.4f}"
+                    f"Step {i+1}/{self.steps} loss {loss.item() * self.grad_accumulation_steps:.4f}"
                 )
                 pbar.update(1)
 
-                self.writer.add_scalar('Loss/total', loss.item(), i)
+                self.writer.add_scalar('Loss/total', loss.item() * self.grad_accumulation_steps, i)
                 self.writer.add_scalar('Accuracy/coarse', metrics.get('acc_coarse', 0.0), i)
                 self.writer.add_scalar('Accuracy/keypoint', metrics.get('acc_kp', 0.0), i)
                 self.writer.add_scalar('Count/matches_coarse', metrics.get('nb_coarse', 0), i)
@@ -256,6 +309,11 @@ class Trainer:
                     self.writer.add_scalar('Loss/variance', metrics.get('loss_variance', 0.0), i)
                     self.writer.add_scalar('Loss/matchability', metrics.get('loss_matchability', 0.0), i)
                     self.writer.add_scalar('Loss/keypoint_pos', metrics.get('loss_keypoint', 0.0), i)
+                
+                # Periodic cleanup
+                if (i + 1) % 10 == 0:
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
         print('Training finished.')
 
